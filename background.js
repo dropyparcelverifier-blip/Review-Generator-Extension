@@ -732,7 +732,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'save_file') {
     // Silent save — no "Save As" dialog, auto-rename on conflict.
     chrome.downloads.download(
-      { url: msg.dataUrl, filename: msg.filename, saveAs: false, conflictAction: 'uniquify' },
+      { url: msg.dataUrl, filename: msg.filename, saveAs: false, conflictAction: msg.conflictAction || 'uniquify' },
       (downloadId) => {
         if (chrome.runtime.lastError || downloadId === undefined) {
           sendResponse({ ok: false, error: chrome.runtime.lastError?.message || 'download failed' });

@@ -3,7 +3,10 @@
 // ============================================================
 
 let products = [];   // [{ asin, sku }]
-let runCsvRows = []; // CSV data rows accumulated across ALL products this run (one combined file)
+// ONE combined CSV per batch, persisted across Stop→Continue/resume so all
+// reviews keep going into the SAME file (no duplicate "reviews (1).csv").
+// { fileName, rows: string[] } — rows are accumulated across every run of the batch.
+let csvBatch = null;
 let lastFailed = []; // items that failed/were skipped in the last run (for Retry)
 let uploadedFileIds = []; // Shopify Files IDs uploaded this run (for "Clear images")
 let doneAsins = new Set(); // ASINs already completed (persisted) — skipped on re-run
@@ -534,9 +537,27 @@ async function startProcessing() {
   resumeBtn.classList.add('hidden');
 
   const results = [];
+  const generatedAsins = []; // produced reviews this run — marked "done" ONLY after the CSV is written
   const totalProducts = products.length;
   uploadedFileIds = [];
-  runCsvRows = []; // start a fresh combined CSV for this run
+
+  // Resume vs. fresh batch for the combined CSV. The batch is identified by its
+  // ASIN list: if the current list overlaps the persisted batch's ASINs (a
+  // resume of the same list, or a Retry of its failed items), keep appending to
+  // the SAME file. A brand-new list starts a fresh file with a stable name
+  // (persisted so future re-runs reuse it instead of creating a duplicate).
+  const persisted = await loadCsvBatch();
+  const inSameBatch = persisted && persisted.fileName && Array.isArray(persisted.rows)
+    && Array.isArray(persisted.asins) && products.some((p) => persisted.asins.includes(p.asin));
+  if (inSameBatch) {
+    csvBatch = persisted;
+  } else {
+    const dateStr = new Date().toISOString().slice(0, 10);
+    csvBatch = { fileName: `reviews_${dateStr}_${Date.now()}.csv`, rows: [], asins: products.map((p) => p.asin) };
+  }
+  const rowsBefore = csvBatch.rows.length; // rows carried over from earlier runs of this batch
+  if (rowsBefore) log(`Resuming batch — appending to ${csvBatch.fileName} (${rowsBefore} review(s) already in it)`, 'info');
+
   resetStats(totalProducts);
   buildAsinTable(products);
   startTimer();
@@ -575,8 +596,11 @@ async function startProcessing() {
     updateAsinRow(i, classifyResult(result), result.name,
       `${result.reviews || 0} rev${result.images ? ` · ${result.images} img` : ''}`);
 
-    // Persist progress once a product actually produced reviews.
-    if ((result.reviews || 0) > 0) markDone(item.asin);
+    // Don't mark "done" yet — the combined CSV is written once at the end of the
+    // run, so an ASIN is only safe to skip on re-run AFTER its reviews are in
+    // that file. Marking here would lose reviews if the run is interrupted
+    // before the CSV is written. We commit these below, post-write.
+    if ((result.reviews || 0) > 0) generatedAsins.push(item.asin);
 
     // Update live metrics
     stats.done++;
@@ -592,13 +616,17 @@ async function startProcessing() {
     }
   }
 
-  // Write ONE combined CSV for the whole run/batch (all products in a single
-  // file), even if the run was stopped early — so partial progress is saved.
-  if (runCsvRows.length) {
-    const dateStr = new Date().toISOString().slice(0, 10);
-    const fileName = `reviews_${dateStr}_${runCsvRows.length}reviews.csv`;
-    writeCombinedCsv(runCsvRows, fileName);
-    log(`✅ ${fileName} downloaded — ${runCsvRows.length} reviews from this run in one file!`, 'success');
+  // Write/overwrite the ONE combined CSV for this batch — same file across
+  // Stop→Continue/resume (overwrite, never "reviews (1).csv"). Runs even if the
+  // run was stopped early, so partial progress is saved. Only the rows added
+  // this run need committing; the file already holds the carried-over ones.
+  const addedThisRun = csvBatch.rows.length - rowsBefore;
+  if (csvBatch.rows.length) {
+    writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
+    saveCsvBatch(); // persist so a later resume appends to this same file
+    log(`✅ ${csvBatch.fileName} saved — ${addedThisRun} new this run, ${csvBatch.rows.length} reviews total in the file`, 'success');
+    // Safe now to remember these ASINs as done so they're skipped on a re-run.
+    generatedAsins.forEach(markDone);
   }
 
   // Close Gemini tab + the shared scraping tab
@@ -1024,8 +1052,8 @@ async function processProduct(item, productIndex, totalProducts) {
     // SKU is deterministic from the input ASIN — always filled. Pass image items
     // ({url, persona}) so each photo lands on a same-gender review.
     const rows = buildCsvRows(allReviews, sku, productData.photoItems || []);
-    runCsvRows.push(...rows);
-    log(`✅ ${allReviews.length} reviews added to the combined CSV (run total: ${runCsvRows.length})`, 'success');
+    csvBatch.rows.push(...rows);
+    log(`✅ ${allReviews.length} reviews added to the combined CSV (file total: ${csvBatch.rows.length})`, 'success');
   } else {
     log('No reviews generated for this product', 'error');
   }
@@ -1303,7 +1331,8 @@ function writeCombinedCsv(rows, fileName) {
   // UTF-8 data URL keeps any emojis intact. Falls back to a Blob download.
   try {
     const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
-    chrome.runtime.sendMessage({ action: 'save_file', filename: fileName, dataUrl }, (resp) => {
+    // overwrite (not uniquify) so resuming a batch keeps ONE file, not copies.
+    chrome.runtime.sendMessage({ action: 'save_file', filename: fileName, dataUrl, conflictAction: 'overwrite' }, (resp) => {
       if (chrome.runtime.lastError || !resp || !resp.ok) {
         downloadCsvFallback(csv, fileName);
       }
@@ -1620,7 +1649,23 @@ function markDone(asin) {
 function resetProgress() {
   doneAsins = new Set();
   saveProgress();
+  clearCsvBatch(); // forgetting progress starts a brand-new CSV file next run
   updateProgressUi();
+}
+
+// --- Combined CSV batch: persisted so Stop→Continue/resume keeps ONE file ---
+function loadCsvBatch() {
+  return new Promise((resolve) => {
+    try { chrome.storage.local.get(['csvBatch'], (r) => resolve((r && r.csvBatch) || null)); }
+    catch (e) { resolve(null); }
+  });
+}
+function saveCsvBatch() {
+  try { chrome.storage.local.set({ csvBatch }); } catch (e) {}
+}
+function clearCsvBatch() {
+  csvBatch = null;
+  try { chrome.storage.local.remove('csvBatch'); } catch (e) {}
 }
 function updateProgressUi() {
   const el = document.getElementById('progressInfo');
