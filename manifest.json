@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "Review Generator - Dropy.in",
+  "version": "1.0.0",
+  "description": "Generate realistic Indian product reviews using Gemini AI for Dropy.in products",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "downloads",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://gemini.google.com/*",
+    "https://dropy.in/*",
+    "https://www.google.com/*",
+    "https://lens.google.com/*",
+    "https://www.amazon.in/*",
+    "https://www.amazon.com/*",
+    "https://www.flipkart.com/*",
+    "https://*.myshopify.com/*",
+    "https://shopify-staged-uploads.storage.googleapis.com/*",
+    "https://*.storage.googleapis.com/*"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Review Generator",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["gemini-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://dropy.in/*"],
+      "js": ["dropy-content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

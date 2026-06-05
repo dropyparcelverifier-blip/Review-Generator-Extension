@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Review Generator</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="logo">
+        <div class="logo-icon">⚡</div>
+        <div>
+          <h1>Review Generator</h1>
+          <p class="subtitle">Dropy.in Product Reviews</p>
+        </div>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="tab-run">Run</button>
+      <button class="tab-btn" data-tab="tab-history">History</button>
+      <button class="tab-btn" data-tab="tab-settings">Settings</button>
+    </nav>
+
+    <div class="content">
+      <div id="tab-run" class="tab-panel active">
+      <!-- Step 1: Upload -->
+      <section id="step-upload" class="step active">
+        <div class="step-header">
+          <span class="step-num">1</span>
+          <h2>Upload ASIN List</h2>
+        </div>
+        <div class="upload-zone" id="dropZone">
+          <div class="upload-icon">📁</div>
+          <p>Drop .txt file here or <label for="fileInput" class="browse-link">browse</label></p>
+          <p class="hint">One Amazon ASIN per line (e.g. B071HN7KK6)</p>
+          <input type="file" id="fileInput" accept=".txt,.csv,.xlsx,.xls" hidden>
+        </div>
+        <div id="fileInfo" class="file-info hidden">
+          <span class="file-name" id="fileName"></span>
+          <span class="file-count" id="fileCount"></span>
+          <button class="btn-remove" id="removeFile">✕</button>
+        </div>
+        <button class="btn-primary" id="startBtn" disabled>Start Generating Reviews</button>
+      </section>
+
+      <!-- Step 2: Processing -->
+      <section id="step-processing" class="step hidden">
+        <div class="step-header">
+          <span class="step-num">2</span>
+          <h2>Generating Reviews</h2>
+        </div>
+        
+        <div class="progress-overview">
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="overallProgress"></div>
+          </div>
+          <div class="progress-row">
+            <p class="progress-text" id="overallText">Product 0 / 0</p>
+            <p class="progress-text" id="timeText">00:00 elapsed</p>
+          </div>
+        </div>
+
+        <div class="metrics" id="metrics">
+          <div class="metric"><div class="metric-value" id="mDone">0</div><div class="metric-label">Done</div></div>
+          <div class="metric"><div class="metric-value" id="mReviews">0</div><div class="metric-label">Reviews</div></div>
+          <div class="metric"><div class="metric-value" id="mImages">0</div><div class="metric-label">Images</div></div>
+          <div class="metric"><div class="metric-value warn" id="mIssues">0</div><div class="metric-label">Issues</div></div>
+        </div>
+
+        <div class="current-product" id="currentProduct">
+          <div class="product-name" id="currentProductName">—</div>
+          <div class="product-status" id="currentProductStatus">Waiting...</div>
+          <div class="batch-progress">
+            <div class="progress-bar-container small">
+              <div class="progress-bar accent" id="batchProgress"></div>
+            </div>
+            <p class="batch-text" id="batchText">Batch 0 / 0</p>
+          </div>
+        </div>
+
+        <div id="imagePicker" class="image-picker hidden">
+          <h3>Select review images</h3>
+          <div class="product-ref" id="productRef"></div>
+          <p class="picker-hint" id="pickerHint">Tap an image to ✓ keep it (uploaded as a review photo). Use ✕ to remove a wrong/other-product image, and ⤢ to view it full size. Only ticked images are used.</p>
+          <div class="image-grid" id="imageGrid"></div>
+          <div class="control-row">
+            <button class="btn-resume" id="useImagesBtn">Upload selected &amp; continue</button>
+            <button class="btn-secondary" id="skipImagesBtn">Skip images</button>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <h3>Products</h3>
+          <div class="asin-table" id="asinTable"></div>
+        </div>
+
+        <div class="log-container">
+          <div class="log-header">
+            <h3>Activity Log</h3>
+            <button class="btn-mini" id="clearLogBtn">Clear</button>
+          </div>
+          <div class="log" id="logArea"></div>
+        </div>
+
+        <div class="control-row">
+          <button class="btn-secondary hidden" id="pauseBtn">⏸ Pause</button>
+          <button class="btn-resume hidden" id="resumeBtn">▶ Continue</button>
+          <button class="btn-danger hidden" id="stopBtn">⏹ Stop</button>
+        </div>
+      </section>
+
+      <!-- Step 3: Complete -->
+      <section id="step-complete" class="step hidden">
+        <div class="step-header">
+          <span class="step-num">✓</span>
+          <h2>Done</h2>
+        </div>
+
+        <div class="summary-grid" id="summaryGrid"></div>
+
+        <div class="charts" id="charts"></div>
+
+        <div class="results-header">
+          <h3>Per-product results</h3>
+          <span class="results-filter" id="resultsCount"></span>
+        </div>
+        <div class="results" id="results"></div>
+
+        <div class="control-row">
+          <button class="btn-resume hidden" id="retryBtn">↻ Retry failed</button>
+          <button class="btn-primary" id="resetBtn">New batch</button>
+        </div>
+        <button class="btn-danger hidden" id="clearImagesBtn">🗑 Delete uploaded images from Shopify</button>
+      </section>
+      </div><!-- /tab-run -->
+
+      <!-- History tab -->
+      <div id="tab-history" class="tab-panel">
+        <div class="step-header"><span class="step-num">⏱</span><h2>Run History</h2></div>
+        <div class="history-actions">
+          <span class="hint" id="historyHint">Past runs are saved on this device.</span>
+          <button class="btn-mini" id="clearHistoryBtn">Clear history</button>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </div>
+
+      <!-- Settings tab -->
+      <div id="tab-settings" class="tab-panel">
+        <div class="step-header"><span class="step-num">⚙</span><h2>Settings</h2></div>
+
+        <div class="settings-group">
+          <h3>Reviews per product</h3>
+          <div class="setting-row">
+            <label>Min</label><input type="number" id="setMin" min="1" max="500" value="25">
+            <label>Max</label><input type="number" id="setMax" min="1" max="500" value="100">
+          </div>
+          <div class="setting-row">
+            <label>Batch size</label><input type="number" id="setBatch" min="1" max="20" value="10">
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <h3>Image sources</h3>
+          <label class="toggle"><input type="checkbox" id="srcLens" checked> Google Lens visual matches</label>
+          <label class="toggle"><input type="checkbox" id="srcGoogle" checked> Google Images (review photos)</label>
+          <label class="toggle"><input type="checkbox" id="srcPinterest" checked> Pinterest</label>
+          <label class="toggle"><input type="checkbox" id="srcAmazon" checked> Amazon customer-review photos</label>
+        </div>
+
+        <div class="settings-group">
+          <h3>Amazon marketplace (for review photos)</h3>
+          <select id="setMarket">
+            <option value="in,com">amazon.in, then .com</option>
+            <option value="in">amazon.in only</option>
+            <option value="com">amazon.com only</option>
+          </select>
+        </div>
+
+        <div class="settings-group">
+          <h3>Shopify (image hosting)</h3>
+          <p class="hint">The Shopify token lives in the private <code>config.js</code> file.</p>
+        </div>
+
+        <div class="settings-group">
+          <h3>Uploaded images (Shopify)</h3>
+          <p class="hint" id="uploadedInfo">No images uploaded yet.</p>
+          <button class="btn-danger" id="deleteAllImagesBtn">🗑 Delete ALL uploaded images from Shopify</button>
+        </div>
+
+        <div class="settings-group">
+          <h3>Progress (resume)</h3>
+          <p class="hint" id="progressInfo">No completed ASINs yet.</p>
+          <p class="hint">Completed ASINs are remembered and skipped if you run the same list again.</p>
+          <button class="btn-mini" id="resetProgressBtn">Reset progress</button>
+        </div>
+
+        <button class="btn-primary" id="saveSettingsBtn">Save settings</button>
+        <p class="hint" id="settingsSaved"></p>
+      </div>
+    </div>
+  </div>
+
+  <script src="libs/xlsx.full.min.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

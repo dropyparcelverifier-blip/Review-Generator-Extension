@@ -1,0 +1,1643 @@
+// ============================================================
+// REVIEW GENERATOR - MAIN LOGIC
+// ============================================================
+
+let products = [];   // [{ asin, sku }]
+let runCsvRows = []; // CSV data rows accumulated across ALL products this run (one combined file)
+let lastFailed = []; // items that failed/were skipped in the last run (for Retry)
+let uploadedFileIds = []; // Shopify Files IDs uploaded this run (for "Clear images")
+let doneAsins = new Set(); // ASINs already completed (persisted) — skipped on re-run
+let isProcessing = false;
+let isPaused = false;
+let geminiTabId = null;
+
+// ============================================================
+// INDIAN DATA POOLS
+// ============================================================
+
+const LANGUAGE_STYLES = [
+  'Pure Indian English', 'Hinglish', 'Marathi-English'
+];
+
+// Pool of natural, common review emojis. A random few are suggested per batch
+// so emojis vary across the file instead of always being 👍.
+const EMOJI_POOL = ['❤️', '😍', '🙌', '👌', '🔥', '💯', '😊', '✨', '🥰', '😁', '🙏', '👍', '😎', '💕'];
+
+// ============================================================
+// PROMPT BUILDER
+// ============================================================
+
+// Distinct real-shopper scenarios. Assigning a different one to each review
+// forces variety so reviews don't all sound the same across batches.
+const REVIEW_ANGLES = [
+  'bought it for themselves after seeing it online',
+  'gifted it to their wife/husband',
+  'buying it again (2nd or 3rd time, repeat customer)',
+  'was skeptical at first but ended up liking it',
+  'bought it for their mother/father (elderly parent)',
+  'bought it for their kid/teenager',
+  'a friend or colleague recommended it',
+  'first time trying this brand',
+  'bought it for a specific season problem (winter dryness / summer / monsoon)',
+  'uses it daily before going to office/college',
+  'keeps it for travel / carries in bag',
+  'had a small issue with delivery or packaging but the product itself is fine',
+  'switched to this after their old routine stopped working',
+  'just a quick happy one-liner, very satisfied',
+  'a detailed enthusiast who really got into it',
+  'bought it on a whim, low expectations, pleasantly surprised',
+  'practical no-nonsense buyer who just states if it works',
+  'bought multiple/stocked up for the family'
+];
+
+function buildPrompt(productData, batchNum, totalBatches, reviewCount, usedNames = [], photoGenders = []) {
+  const starDist = randomStarDistribution(reviewCount);
+  const starsForBatch = starDist.join(', ');
+
+  const photoCtx = productData.imageMeta || productData.name || 'the product';
+  const photosThisBatch = photoGenders.length;
+  const genderSpec = photoGenders.map((g, i) => `(${i + 1}) ${g}`).join(', ');
+  const photoRule = photosThisBatch > 0
+    ? `EXACTLY ${photosThisBatch} of the ${reviewCount} reviews in this batch are from customers who ATTACHED THEIR OWN PHOTO. Set "has_photo": true for ONLY those ${photosThisBatch}, and their reviewer genders MUST match this list in order: ${genderSpec}. For each, set "reviewer_gender" accordingly: "female" -> a woman (female Indian name); "male" -> a man (male Indian name); "kids" -> a PARENT writing about their child/baby using it (name can be either gender, mention the kid); "neutral" -> any gender. Those photo reviews may casually reference their pic (tied to ${photoCtx}). EVERY OTHER review: "has_photo": false, must NOT mention any photo, and set "reviewer_gender" to the gender its own name implies ("male"/"female").`
+    : `No review in this batch has a photo: set "has_photo": false for ALL of them, do NOT mention any photo/pic/image, and set "reviewer_gender" ("male"/"female") to match each reviewer's name.`;
+
+  const langStyles = getRandomSubset(LANGUAGE_STYLES, reviewCount);
+  const angles = getRandomSubset(REVIEW_ANGLES, reviewCount);
+
+  const avoidNames = usedNames.length
+    ? `\nDO NOT reuse any of these reviewer names already used for this product (pick fresh, different Indian names): ${usedNames.slice(-60).join(', ')}.`
+    : '';
+
+  const hasEmoji = Math.random() < 0.45;
+  // Rotate a random emoji palette per batch so emojis VARY across the file
+  // instead of every review defaulting to 👍.
+  const emojiPalette = getRandomSubset(EMOJI_POOL, 4);
+  const emojiInstruction = hasEmoji
+    ? `AT MOST 1 review in this batch may include 1-2 natural emojis in its body. If you add one, pick from these and VARY it (do NOT default to 👍): ${emojiPalette.join(' ')}. All other reviews must have ZERO emojis, and NO review title may contain an emoji.`
+    : 'NO emojis in any review in this batch.';
+
+  const includeComparison = Math.random() < 0.2;
+  const comparisonNote = includeComparison
+    ? 'One review in this batch can naturally mention a competitor product for comparison. Keep it subtle and organic.'
+    : 'No competitor comparisons in this batch.';
+
+  const today = new Date().toISOString().split('T')[0];
+  const oneYearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+  const prompt = `You are simulating ${reviewCount} DIFFERENT real Indian shoppers who each bought this product and are quickly writing a review on their phone. They are ordinary people, not writers. Generate exactly ${reviewCount} reviews in strict JSON array format. The reviews must read like genuine human customers - casual, imperfect and varied - NOT like AI or marketing text.
+
+PRODUCT INFORMATION (these are the REAL facts about this exact product - base every review on them, do not contradict or invent beyond them):
+- Product Name: ${productData.name || 'Unknown'}
+- Brand: ${productData.brand || 'N/A'}
+- Category: ${productData.category || 'General'}
+- Key Features (from the listing): ${productData.bullets || productData.short_description || 'N/A'}
+- Description: ${productData.full_description || productData.short_description || 'N/A'}
+- Specifications: ${productData.specifications || 'N/A'}
+- Google AI Overview (real-world summary of what this product is & how people use it - use as factual context, do NOT copy verbatim): ${productData.aiOverview || 'N/A'}
+- Extra research (visual matches / feedback themes): ${productData.webReference || 'N/A'}
+- Review photo context (what the attached customer photos show): ${productData.imageMeta || 'N/A'}
+
+STRICT RULES:
+0. SCRIPT: Write EVERY review (title and body) using ENGLISH / ROMAN letters ONLY. NEVER use Devanagari/Hindi/Marathi script or any non-English alphabet. Marathi-English and Hinglish must be fully romanized - e.g. write "khupach chaan volume aahe", NOT "खूपच छान"; write "magvla hota", NOT "मागवला होता". Not a single native-script character anywhere.
+1. Language styles for each review (in order): ${langStyles.join(', ')}
+2. Star ratings for each review (in order): ${starsForBatch}
+3. EACH review must be based on a DIFFERENT scenario/angle (in order), so no two reviews feel alike: ${angles.map((a, i) => `(${i + 1}) ${a}`).join('; ')}
+4. Reviewer name MUST match the language style (Marathi name + a Maharashtra city like Pune/Nagpur/Nashik for Marathi-English; common North-Indian/neutral Indian names + cities for Hinglish and Indian English). Every name must be UNIQUE within this batch - real first AND last names, vary them widely (not all "Sharma"/"Patil").${avoidNames}
+6. Location must be a realistic Indian city+state matching the reviewer's region
+7. ABSOLUTELY NO price, cost, MRP, discount, deal, offer, or rupee amount mentioned anywhere
+7b. NEVER mention any shopping site or marketplace by name (NO "Amazon", "Flipkart", "Myntra", "Nykaa", "Meesho", "Snapdeal", "Ajio", etc.) and never say "the seller", "this listing" or "ordered it on/from <site>". These reviews are shown on a different store. If mentioning delivery, keep it generic: "the order arrived", "delivery was quick", "packaging was fine".
+8. Talk about REAL personal experience, NOT a feature list. Mention WHY they bought it, who it's for (self, wife, mom, kids, gift), when/how they use it, and how it actually worked for THEM. Refer to the product loosely ("this", "it", "the cream/mousse/balm") - real people rarely repeat the full product name. Each review should naturally include ONE concrete, accurate detail from the product info above (a real benefit, ingredient, material, size, scent or use-case) - woven into their experience, in their own words, not copied like a spec.
+8c. ${photoRule}
+9. ${emojiInstruction}
+10. ${comparisonNote}
+11. Review title: short, casual, 2-7 words - how a real person types it (often lowercase, sometimes just "nice", "good product", "value for money", "as expected"). The review_title MUST be in the SAME language style as that review's review_body (Hinglish title for Hinglish body, Marathi-English title for Marathi-English body). Same person, same casual tone.
+12. Length must VARY A LOT. Roughly half the reviews should be very short (3-12 words, e.g. "Good product, works as expected" or "Bahut accha hai, satisfied"). A few medium. Only 1-2 longer/detailed. Do NOT make them all the same polished paragraph.
+13. Date: random between ${oneYearAgo} and ${today}, format YYYY-MM-DD
+14. Helpful votes: random 0-50 (most reviews should have low numbers like 0-5; only a few higher)
+15. Verified Purchase: always "Yes"
+16. Some reviews can mention how long they have been using it (2 weeks, 1 month, few months), delivery/packaging, or repurchasing.
+17. DO NOT start every review the same way. Vary openings - some start mid-thought, some with the verdict, some with the reason they bought it. No two reviews in this batch may share the same opening words.
+
+HUMAN REALISM - MAKE THEM NOT LOOK AI-GENERATED (very important):
+- Write like a normal Indian shopper typing fast on a phone, NOT like marketing copy or a polished blog.
+- Use casual/imperfect writing: occasional lowercase, missing capital letters, missing commas, run-on or incomplete sentences, casual short forms (gud, nyc, plz, thnx, awsm, mst, rly, pls, n).
+- Add a few small, natural typos in some reviews (not every one).
+- Even 4-5 star reviews can have a tiny gripe ("packaging was so-so but product good", "delivery was late but worth it", "smell could be better").
+- BANNED AI-sounding words/phrases - do NOT use: "exceptional", "exceptionally", "elevate", "game-changer", "top-notch", "highly recommend to anyone", "must-have", "overall", "in conclusion", "truly remarkable", "delve", "seamless", "boasts", "plethora", "when it comes to", "I am thrilled", "this product offers", "leaves much to be desired".
+- Avoid perfectly balanced "pros and cons" structures and tidy summaries. Real reviews are uneven and a bit random.
+- Vary sentence rhythm hugely between reviews. They must read like ${reviewCount} DIFFERENT people, not one writer.
+
+ACCURACY - STAY TRUE TO THE REAL PRODUCT (very important):
+- First work out exactly WHAT this product is and HOW it is actually used from the product info, then make every review clearly about THIS product used correctly. A hair mousse is applied to hair for hold/volume; a lip balm goes on lips; a supplement is consumed for health; etc. NEVER describe a wrong use.
+- Use only REAL facts from the product info. Do NOT invent ingredients, certifications, numbers, claims, model names, colours or features the product does not have. If unsure about a detail, stay general about the experience instead of making something up.
+- Match the product's real category and audience (e.g. baby product -> a parent; men's grooming -> mostly men). Benefits mentioned must be ones this product can actually deliver.
+- Different reviewers should praise/notice DIFFERENT real aspects (one the texture, one the smell, one ease of use, one results over time) so it doesn't sound scripted.
+
+REAL HUMAN EMOTION (very important - this is what makes them believable):
+- Every review must carry a genuine FEELING, not a flat neutral tone. Real people write because they felt something - relief, happiness, excitement, gratitude, mild irritation, surprise, reassurance for their family, etc.
+- Tie the emotion to WHY it mattered to them personally: e.g. relief that a long-standing problem finally got sorted, happiness that a parent/child is comfortable, surprise that it actually worked after doubting it, satisfaction of a repeat buyer who trusts it now.
+- Match the emotion to the star rating: 5-star = clearly happy / impressed / relieved / loyal; 4-star = satisfied but with one honest small letdown they actually felt.
+- Show the feeling through natural words and rhythm (a little emphasis, "honestly", "ngl", "was worried but", "so glad", "thank god", "kaafi khush", "ekdum mast vatla"), NOT by over-the-top gushing or fake drama.
+- Vary the emotion across the batch - do not give them all the same upbeat tone.
+
+RESPOND WITH ONLY A VALID JSON ARRAY. No markdown, no backticks, no explanation. Just the JSON:
+[
+  {
+    "reviewer_name": "Name Here",
+    "location": "City, State",
+    "star_rating": 5,
+    "review_title": "Title here",
+    "review_body": "Body here",
+    "date": "YYYY-MM-DD",
+    "verified_purchase": "Yes",
+    "helpful_votes": 12,
+    "language_style": "Hinglish",
+    "has_photo": false,
+    "reviewer_gender": "male"
+  }
+]`;
+
+  return prompt;
+}
+
+function randomStarDistribution(count) {
+  const stars = [];
+  for (let i = 0; i < count; i++) {
+    const rand = Math.random();
+    if (rand < 0.65) stars.push(5);
+    else stars.push(4);
+  }
+  return stars;
+}
+
+function getRandomSubset(arr, count) {
+  const shuffled = [...arr].sort(() => Math.random() - 0.5);
+  const result = [];
+  for (let i = 0; i < count; i++) {
+    result.push(shuffled[i % shuffled.length]);
+  }
+  return result;
+}
+
+// ============================================================
+// UI CONTROLS
+// ============================================================
+
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const fileInfo = document.getElementById('fileInfo');
+const fileName = document.getElementById('fileName');
+const fileCount = document.getElementById('fileCount');
+const removeFile = document.getElementById('removeFile');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const resumeBtn = document.getElementById('resumeBtn');
+const resetBtn = document.getElementById('resetBtn');
+const imagePicker = document.getElementById('imagePicker');
+const imageGrid = document.getElementById('imageGrid');
+const useImagesBtn = document.getElementById('useImagesBtn');
+const skipImagesBtn = document.getElementById('skipImagesBtn');
+const clearLogBtn = document.getElementById('clearLogBtn');
+const retryBtn = document.getElementById('retryBtn');
+const clearImagesBtn = document.getElementById('clearImagesBtn');
+
+// Live run metrics
+const stats = { total: 0, done: 0, reviews: 0, images: 0, issues: 0, startTime: 0 };
+let timerInterval = null;
+
+function resetStats(total) {
+  stats.total = total; stats.done = 0; stats.reviews = 0; stats.images = 0; stats.issues = 0;
+  stats.startTime = Date.now();
+  renderMetrics();
+}
+
+function renderMetrics() {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set('mDone', `${stats.done}/${stats.total}`);
+  set('mReviews', stats.reviews);
+  set('mImages', stats.images);
+  set('mIssues', stats.issues);
+}
+
+function fmtTime(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function startTimer() {
+  stopTimer();
+  timerInterval = setInterval(() => {
+    const elapsed = Date.now() - stats.startTime;
+    const avg = stats.done > 0 ? elapsed / stats.done : 0;
+    const remaining = avg > 0 ? avg * (stats.total - stats.done) : 0;
+    const txt = document.getElementById('timeText');
+    if (txt) txt.textContent = remaining > 0
+      ? `${fmtTime(elapsed)} elapsed · ~${fmtTime(remaining)} left`
+      : `${fmtTime(elapsed)} elapsed`;
+  }, 1000);
+}
+
+function stopTimer() {
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+}
+
+// File Upload
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', (e) => {
+  if (e.target.files.length) handleFile(e.target.files[0]);
+});
+removeFile.addEventListener('click', resetUpload);
+startBtn.addEventListener('click', startProcessing);
+
+stopBtn.addEventListener('click', () => {
+  isProcessing = false;
+  isPaused = false; // release any pause-wait so the loop can exit
+  if (pickResolve) pickResolve([]); // release a pending image picker
+  pauseBtn.classList.add('hidden');
+  resumeBtn.classList.add('hidden');
+  log('Stopping after current step...', 'warn');
+});
+
+pauseBtn.addEventListener('click', () => {
+  isPaused = true;
+  pauseBtn.classList.add('hidden');
+  resumeBtn.classList.remove('hidden');
+  updateProductStatus('Paused', null);
+  log('Paused — will hold at the next safe point. Click Continue to resume.', 'warn');
+});
+
+resumeBtn.addEventListener('click', () => {
+  isPaused = false;
+  resumeBtn.classList.add('hidden');
+  pauseBtn.classList.remove('hidden');
+  log('Resumed', 'success');
+});
+
+resetBtn.addEventListener('click', () => {
+  products = [];
+  showStep('step-upload');
+  resetUpload();
+});
+
+clearLogBtn.addEventListener('click', () => {
+  document.getElementById('logArea').innerHTML = '';
+});
+
+clearImagesBtn.addEventListener('click', async () => {
+  if (!uploadedFileIds.length) return;
+  if (!confirm(`Delete ${uploadedFileIds.length} uploaded image(s) from Shopify Files? This can't be undone.`)) return;
+  clearImagesBtn.disabled = true;
+  clearImagesBtn.textContent = 'Deleting...';
+  const res = await new Promise((resolve) =>
+    chrome.runtime.sendMessage({ action: 'delete_shopify_files', fileIds: uploadedFileIds }, (r) => resolve(r || {}))
+  );
+  log(`Deleted ${res.deleted || 0} image(s) from Shopify`, res.ok ? 'success' : 'warn');
+  uploadedFileIds = [];
+  clearImagesBtn.disabled = false;
+  clearImagesBtn.classList.add('hidden');
+});
+
+retryBtn.addEventListener('click', () => {
+  if (lastFailed.length === 0) return;
+  products = lastFailed.slice();
+  startProcessing();
+});
+
+// Blocks while the run is paused (and still active), so processing halts at a
+// safe checkpoint without losing progress. Returns when resumed or stopped.
+async function waitWhilePaused() {
+  while (isPaused && isProcessing) {
+    await sleep(400);
+  }
+}
+
+// --- Image picker: shows candidate images and resolves with the chosen items ---
+let pickResolve = null;
+let pickItems = [];
+
+// items: array of { url, dataUrl }. Displays dataUrl (reliable) or url, and
+// resolves with the selected items (objects), preserving url + bytes.
+function pickImages(items) {
+  return new Promise((resolve) => {
+    if (!items || items.length === 0 || !isProcessing) { resolve([]); return; }
+    imageGrid.innerHTML = '';
+    items.forEach((item, idx) => {
+      const display = item.dataUrl || item.thumb || item.url; // thumb loads reliably
+      if (!display) return;
+      const cell = document.createElement('div');
+      cell.className = 'image-cell';
+      cell.dataset.idx = idx;
+
+      const img = document.createElement('img');
+      img.src = display;
+      img.loading = 'lazy';
+      img.onerror = () => cell.remove(); // drop images that won't load
+      img.onload = () => {
+        const w = img.naturalWidth || 0, h = img.naturalHeight || 0;
+        const r = h ? w / h : 1;
+        // Drop banner/ad shapes (the preview keeps the real aspect ratio). We
+        // display a thumbnail but UPLOAD the full-res source, so don't size-filter.
+        if (w && h && (r > 2.4 || r < 0.4)) cell.remove();
+      };
+
+      const check = document.createElement('span');
+      check.className = 'check';
+      check.textContent = '✓';
+
+      // persona tag: who the photo represents -> drives the matched reviewer
+      cell.dataset.persona = item.persona || 'neutral';
+      const personaBar = document.createElement('div');
+      personaBar.className = 'persona-bar';
+      [['neutral', '—'], ['female', '♀'], ['male', '♂'], ['kids', '🧒']].forEach(([val, label]) => {
+        const b = document.createElement('button');
+        b.className = 'persona-btn' + (cell.dataset.persona === val ? ' active' : '');
+        b.textContent = label;
+        b.title = val;
+        b.addEventListener('click', (e) => {
+          e.stopPropagation();
+          cell.dataset.persona = val;
+          personaBar.querySelectorAll('.persona-btn').forEach((x) => x.classList.remove('active'));
+          b.classList.add('active');
+        });
+        personaBar.appendChild(b);
+      });
+
+      // ✕ remove this image entirely (e.g. it's a different/irrelevant product)
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'cell-btn cell-remove';
+      removeBtn.title = 'Remove this image';
+      removeBtn.textContent = '✕';
+      removeBtn.addEventListener('click', (e) => { e.stopPropagation(); cell.remove(); });
+
+      // ⤢ open the original full-size image in a new tab to inspect
+      const zoom = document.createElement('a');
+      zoom.className = 'cell-btn cell-zoom';
+      zoom.title = 'View original size';
+      zoom.textContent = '⤢';
+      zoom.href = item.url || display;
+      zoom.target = '_blank';
+      zoom.rel = 'noopener';
+      zoom.addEventListener('click', (e) => e.stopPropagation());
+
+      cell.appendChild(img);
+      cell.appendChild(check);
+      cell.appendChild(removeBtn);
+      cell.appendChild(zoom);
+      cell.appendChild(personaBar);
+      cell.addEventListener('click', () => cell.classList.toggle('selected')); // tick = keep
+      imageGrid.appendChild(cell);
+    });
+    pickItems = items;
+    imagePicker.classList.remove('hidden');
+    updateProductStatus('Select review images, then click Continue', null);
+    pickResolve = (val) => {
+      imagePicker.classList.add('hidden');
+      pickResolve = null;
+      pickItems = [];
+      resolve(val);
+    };
+  });
+}
+
+function collectSelectedImages() {
+  return Array.from(imageGrid.querySelectorAll('.image-cell.selected'))
+    .map((c) => {
+      const it = pickItems[Number(c.dataset.idx)];
+      return it ? Object.assign({}, it, { persona: c.dataset.persona || 'neutral' }) : null;
+    })
+    .filter(Boolean);
+}
+
+useImagesBtn.addEventListener('click', () => { if (pickResolve) pickResolve(collectSelectedImages()); });
+skipImagesBtn.addEventListener('click', () => { if (pickResolve) pickResolve([]); });
+
+const ASIN_RE = /\b(B0[A-Z0-9]{8}|\d{9}[\dX])\b/i; // ASIN: B0XXXXXXXX or 10-digit ISBN-style
+
+// Pulls a clean ASIN out of a raw cell/line: accepts a bare ASIN, a
+// "Dropy-<ASIN>" sku, or an Amazon URL containing /dp/<ASIN> or /gp/product/<ASIN>.
+function extractAsin(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  const dp = s.match(/\/(?:dp|gp\/product|product)\/([A-Z0-9]{10})/i);
+  if (dp) return dp[1].toUpperCase();
+  const m = s.match(ASIN_RE);
+  return m ? m[1].toUpperCase() : null;
+}
+
+function buildProducts(asins) {
+  // de-dupe while preserving order
+  const seen = new Set();
+  const list = [];
+  for (const a of asins) {
+    if (a && !seen.has(a)) { seen.add(a); list.push({ asin: a, sku: `Dropy-${a}` }); }
+  }
+  return list;
+}
+
+function finalizeUpload(file, parsedCount) {
+  if (products.length === 0) {
+    alert('No valid ASINs found. The file should list one ASIN per line (e.g. B071HN7KK6).');
+    return;
+  }
+  const dupes = (parsedCount || products.length) - products.length;
+  fileName.textContent = file.name;
+  fileCount.textContent = dupes > 0 ? `${products.length} ASINs (${dupes} duplicate${dupes > 1 ? 's' : ''} removed)` : `${products.length} ASINs`;
+  dropZone.classList.add('hidden');
+  fileInfo.classList.remove('hidden');
+  startBtn.disabled = false;
+}
+
+function handleFile(file) {
+  const isTxtOrCsv = /\.(txt|csv)$/i.test(file.name);
+  const isExcel = /\.xlsx?$/i.test(file.name);
+
+  if (!isTxtOrCsv && !isExcel) {
+    alert('Please upload a .txt file with one ASIN per line (or an .xlsx).');
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      let asins = [];
+      if (isTxtOrCsv) {
+        asins = String(e.target.result)
+          .split(/[\r\n,]+/)
+          .map(extractAsin)
+          .filter(Boolean);
+      } else {
+        const workbook = XLSX.read(e.target.result, { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+        // Scan every cell for an ASIN (handles bare ASIN / Dropy-<ASIN> / URL columns)
+        asins = rows.flat().map(extractAsin).filter(Boolean);
+      }
+      products = buildProducts(asins);
+      finalizeUpload(file, asins.length);
+    } catch (err) {
+      alert('Error reading file: ' + err.message);
+    }
+  };
+
+  if (isTxtOrCsv) reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+function resetUpload() {
+  products = [];
+  fileInput.value = '';
+  dropZone.classList.remove('hidden');
+  fileInfo.classList.add('hidden');
+  startBtn.disabled = true;
+}
+
+function showStep(stepId) {
+  document.querySelectorAll('.step').forEach(s => { s.classList.remove('active'); s.classList.add('hidden'); });
+  const step = document.getElementById(stepId);
+  step.classList.remove('hidden');
+  step.classList.add('active');
+}
+
+function log(message, type = 'info') {
+  const logArea = document.getElementById('logArea');
+  const time = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  entry.innerHTML = `<span class="log-time">${time}</span><span class="log-${type}">${message}</span>`;
+  logArea.appendChild(entry);
+  logArea.scrollTop = logArea.scrollHeight;
+}
+
+// ============================================================
+// MAIN PROCESSING
+// ============================================================
+
+async function startProcessing() {
+  if (!products.length) {
+    alert('No ASINs to process. Please upload a .txt list first.');
+    return;
+  }
+  isProcessing = true;
+  isPaused = false;
+  showStep('step-processing');
+  stopBtn.classList.remove('hidden');
+  pauseBtn.classList.remove('hidden');
+  resumeBtn.classList.add('hidden');
+
+  const results = [];
+  const totalProducts = products.length;
+  uploadedFileIds = [];
+  runCsvRows = []; // start a fresh combined CSV for this run
+  resetStats(totalProducts);
+  buildAsinTable(products);
+  startTimer();
+
+  for (let i = 0; i < totalProducts; i++) {
+    await waitWhilePaused();
+    if (!isProcessing) {
+      log('Processing stopped by user', 'warn');
+      break;
+    }
+
+    const item = products[i];
+    updateOverallProgress(i + 1, totalProducts);
+
+    // Resume: skip ASINs already completed in a previous run.
+    if (doneAsins.has(item.asin)) {
+      updateAsinRow(i, 'done', item.asin, 'already done');
+      log(`Skipping ${item.asin} — already done in a previous run`, 'info');
+      results.push({ asin: item.asin, sku: item.sku, name: item.asin, reviews: 0, images: 0, alreadyDone: true });
+      stats.done++;
+      renderMetrics();
+      continue;
+    }
+
+    updateAsinRow(i, 'processing');
+    log(`Starting ${i + 1}/${totalProducts}: ${item.asin}`, 'info');
+
+    let result;
+    try {
+      result = await processProduct(item, i, totalProducts);
+    } catch (err) {
+      log(`Error processing ${item.asin}: ${err.message}`, 'error');
+      result = { asin: item.asin, sku: item.sku, name: 'Error', reviews: 0, images: 0, error: err.message };
+    }
+    results.push(result);
+    updateAsinRow(i, classifyResult(result), result.name,
+      `${result.reviews || 0} rev${result.images ? ` · ${result.images} img` : ''}`);
+
+    // Persist progress once a product actually produced reviews.
+    if ((result.reviews || 0) > 0) markDone(item.asin);
+
+    // Update live metrics
+    stats.done++;
+    stats.reviews += (result.reviews || 0);
+    stats.images += (result.images || 0);
+    if (result.error || (result.reviews || 0) === 0) stats.issues++;
+    renderMetrics();
+
+    // Wait between products
+    if (i < totalProducts - 1 && isProcessing) {
+      log('Cooling down before next product...', 'info');
+      await sleep(1000);
+    }
+  }
+
+  // Write ONE combined CSV for the whole run/batch (all products in a single
+  // file), even if the run was stopped early — so partial progress is saved.
+  if (runCsvRows.length) {
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const fileName = `reviews_${dateStr}_${runCsvRows.length}reviews.csv`;
+    writeCombinedCsv(runCsvRows, fileName);
+    log(`✅ ${fileName} downloaded — ${runCsvRows.length} reviews from this run in one file!`, 'success');
+  }
+
+  // Close Gemini tab + the shared scraping tab
+  if (geminiTabId) {
+    chrome.runtime.sendMessage({ action: 'close_tab', tabId: geminiTabId });
+    geminiTabId = null;
+  }
+  chrome.runtime.sendMessage({ action: 'close_scrape_tab' });
+
+  isProcessing = false;
+  isPaused = false;
+  stopTimer();
+  stopBtn.classList.add('hidden');
+  pauseBtn.classList.add('hidden');
+  resumeBtn.classList.add('hidden');
+
+  showResults(results);
+}
+
+// Self-heal: close any stale Gemini tab and open a fresh one. Used when the
+// tab dies, logs out, or stops responding so the run can repair itself.
+async function recoverGemini() {
+  try {
+    if (geminiTabId) {
+      await new Promise((resolve) =>
+        chrome.runtime.sendMessage({ action: 'close_tab', tabId: geminiTabId }, () => resolve())
+      );
+    }
+  } catch (e) { /* ignore */ }
+
+  geminiTabId = null;
+  const res = await new Promise((resolve) =>
+    chrome.runtime.sendMessage({ action: 'open_gemini' }, resolve)
+  );
+  geminiTabId = res && res.tabId;
+  await sleep(3500);
+  return !!geminiTabId;
+}
+
+async function processProduct(item, productIndex, totalProducts) {
+  const asin = item.asin;
+  const sku = item.sku;
+
+  // Step 1: Find the product on dropy.in (search by SKU) and scrape it
+  updateProductStatus('Finding product on dropy.in...', asin);
+  log(`Looking up ${sku} on dropy.in...`, 'info');
+
+  let productData = await new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: 'dropy_lookup', query: sku }, (response) => resolve(response || {}));
+  });
+  // Fallback: try the plain ASIN as the search query
+  if (!productData.name) {
+    const alt = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ action: 'dropy_lookup', query: asin }, (response) => resolve(response || {}));
+    });
+    if (alt && alt.name) productData = alt;
+  }
+
+  if (!productData.name) {
+    log(`Skipped ${asin}: ${productData.error || 'not found on dropy.in'}`, 'error');
+    updateOverallProgress(productIndex + 1, totalProducts);
+    return { asin, sku, name: asin, reviews: 0, images: 0, error: productData.error || 'dropy lookup failed' };
+  }
+
+  const productName = productData.name;
+  updateProductStatus('Found on dropy.in', productName);
+  log(`Product: ${productName}`, 'success');
+
+  // Step 2: gather REAL user photos from several sources. Each result item is
+  // { full, thumb, ctx, ugc } — we DISPLAY the thumb (loads reliably) and UPLOAD
+  // the full-res source (high quality). Lens drives the visual search.
+  const bg = (msg) => new Promise((resolve) => chrome.runtime.sendMessage(msg, (r) => resolve(r || {})));
+  const originals = productData.originalImages || [];
+  const lensSource = originals[0] || '';
+  const webItems = [];
+  let lensText = '';
+
+  let lens = {};
+  if (settings.srcLens && isProcessing) {
+    updateProductStatus('Searching Google Lens for real photos...', productName);
+    if (productData.imageData) {
+      log('Searching Google Lens (padded, no-crop) ...', 'info');
+      lens = await bg({ action: 'lens_by_bytes', imageData: productData.imageData });
+    } else if (lensSource) {
+      lens = await bg({ action: 'lens_by_url', imageUrl: lensSource });
+    }
+    lensText = lens.text || '';
+    (lens.items || []).forEach((it) => webItems.push(it));
+    if (lens.searchFileId) addUploadedIds([lens.searchFileId]); // temp search image (clean up later)
+    if (lens.resultUrl) log(`Lens results page: ${lens.resultUrl}`, 'info');
+    if (lens.error) log(`Lens note: ${lens.error}`, 'warn');
+  }
+
+  if (settings.srcGoogle && isProcessing) {
+    try {
+      updateProductStatus('Searching social/review photos...', productName);
+      log('Searching Google Images for real review photos...', 'info');
+      const gi = await bg({ action: 'google_images', query: `${productName} ${productData.brand || ''} review` });
+      (gi.items || []).forEach((it) => webItems.push(it));
+    } catch (e) { /* optional */ }
+  }
+
+  if (settings.srcPinterest && isProcessing) {
+    try {
+      updateProductStatus('Searching Pinterest...', productName);
+      log('Searching Pinterest...', 'info');
+      const pin = await bg({ action: 'google_images', query: `${productName} ${productData.brand || ''} site:pinterest.com` });
+      (pin.items || []).forEach((it) => webItems.push(it));
+    } catch (e) { /* optional */ }
+  }
+
+  // Extra search vectors: the ASIN and the barcode (UPC/EAN) are unique IDs that
+  // pull the EXACT product's photos. Only run them if we don't already have
+  // plenty of candidates — saves time when the earlier sources sufficed.
+  const barcode = productData.barcode || '';
+  if (settings.srcGoogle && isProcessing && webItems.length < 18) {
+    for (const q of [asin, barcode].filter(Boolean)) {
+      if (!isProcessing || webItems.length >= 18) break;
+      try {
+        log(`Searching by ${q === asin ? 'ASIN' : 'barcode'}: ${q}`, 'info');
+        const r = await bg({ action: 'google_images', query: `${q} ${productData.brand || ''}` });
+        (r.items || []).forEach((it) => webItems.push(it));
+      } catch (e) { /* optional */ }
+    }
+  }
+
+  // Amazon CUSTOMER REVIEW photos — genuinely real, inherently relevant.
+  let amzItems = [];
+  if (settings.srcAmazon && isProcessing) {
+    try {
+      updateProductStatus('Getting Amazon review photos...', productName);
+      log('Scraping Amazon customer review images...', 'info');
+      const amz = await bg({ action: 'amazon_review_images', asin, domains: marketDomains() });
+      amzItems = (amz.images || []).map((u) => ({ full: u, thumb: u, ctx: '', ugc: true }));
+      if (amzItems.length) log(`Amazon review photos: ${amzItems.length} (from ${amz.source || 'amazon'})`, 'success');
+    } catch (e) { /* optional */ }
+  }
+
+  // Relevance (UNIVERSAL): keep web items whose context mentions this product's
+  // brand/name keywords; drop clear other-product matches.
+  const STOP = new Set([
+    'the','and','for','with','from','your','this','that','to','in','of','by','at','on',
+    'review','reviews','best','price','buy','online','official','store','amazon','flipkart','new',
+    'look','product','products','set','combo','kit','value','genuine','authentic','original',
+    'premium','natural','organic','pure','advanced','professional','classic','edition','version',
+    'multi','all','daily','use','pack','packs','refill','free',
+    'gram','grams','litre','liter','litres','liters','inch','inches','meter','metre','count','counts',
+    'piece','pieces','pair','pairs','size','sizes','large','small','medium','mini','plus','color','colour',
+    'cream','lotion','serum','face','skin','care','hair','body','day','night',
+    'moisturizer','moisturiser','milliliters','millilitre','ounce','ounces'
+  ]);
+  const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const words = (s) => ((s || '').toLowerCase().match(/[a-z0-9]+/g) || []);
+  const brandTokens = words(productData.brand).filter((w) => w.length >= 3 && !STOP.has(w));
+  const nameTokens = words(productName).filter((w) => w.length >= 4 && !STOP.has(w));
+  const tokens = Array.from(new Set([...brandTokens, ...nameTokens])).slice(0, 12);
+  // ASIN / barcode are exact unique IDs — a context containing either is a sure match.
+  const idTokens = [norm(asin), norm(barcode)].filter((t) => t && t.length >= 6);
+  const relevant = (ctx) => {
+    const c = norm(ctx);
+    if (!c) return true;                         // no context -> keep
+    if (idTokens.some((t) => c.includes(t))) return true;  // exact ASIN/barcode hit
+    return tokens.length === 0 || tokens.some((t) => c.includes(t));
+  };
+
+  // Merge: Amazon review photos lead, then web items.
+  //  - "matched"  = context names THIS product (brand/name/ASIN/barcode) -> trusted
+  //  - "unknown"  = no context at all -> kept only to top up (capped)
+  //  - mismatch (context names a DIFFERENT product) -> dropped
+  const matched = [];
+  const unknown = [];
+  const seenFull = new Set();
+  let dropped = 0;
+  amzItems.forEach((it) => { if (it.full && !seenFull.has(it.full)) { seenFull.add(it.full); matched.push(it); } });
+  webItems.forEach((it) => {
+    if (!it || !it.full || seenFull.has(it.full)) return;
+    seenFull.add(it.full);
+    const c = norm(it.ctx);
+    if (!c) { unknown.push(it); return; }                       // can't judge
+    if (idTokens.some((t) => c.includes(t)) || tokens.some((t) => c.includes(t))) matched.push(it); // confirmed
+    else dropped++;                                              // different product
+  });
+  matched.sort((a, b) => (b.ugc ? 1 : 0) - (a.ugc ? 1 : 0)); // amazon/ugc first
+  // Only pad with unknowns if we don't have many confirmed matches.
+  const unknownCap = matched.length >= 12 ? 0 : Math.max(6, 12 - matched.length);
+  const kept = matched.concat(unknown.slice(0, unknownCap));
+  if (dropped) log(`Filtered out ${dropped} other-product image(s)`, 'info');
+  if (unknown.length > unknownCap) log(`Hid ${unknown.length - unknownCap} unverified image(s) (use ✕ to remove any wrong ones)`, 'info');
+
+  // Candidates: thumb for display, full for upload. Catalog images only if empty.
+  const candidates = kept.map((it) => ({ url: it.full, thumb: it.thumb, dataUrl: '', alt: '' }));
+  if (!candidates.length) {
+    log('No real photos found — falling back to product images', 'warn');
+    originals.forEach((u) => candidates.push({ url: u, thumb: u, dataUrl: '', alt: '' }));
+    (productData.gallery || []).forEach((g) => candidates.push({ url: g.url, thumb: g.data || g.url, dataUrl: g.data, alt: g.alt }));
+  }
+  log(`Candidates ready: ${kept.length} photo(s) (${matched.length} confirmed this product)`, 'info');
+
+  // Step 3: Manual image selection (the run pauses here for you to pick)
+  let imageUrls = [];
+  if (candidates.length && isProcessing) {
+    log('Select the review images, then click "Upload selected & continue"...', 'info');
+    // Show the ACTUAL product (from dropy) as a large reference while picking.
+    const g0 = (productData.gallery && productData.gallery[0]) || {};
+    const refImg = g0.data || originals[0] || productData.image || '';        // displays reliably
+    const refFull = originals[0] || g0.url || productData.image || refImg;     // full-size on tap
+    setProductRef(refImg, productName, refFull);
+    const selected = await pickImages(candidates);
+    setProductRef('', '');
+
+    if (selected.length && isProcessing) {
+      // Original Shopify images are already public — used directly. Others are
+      // re-hosted on Shopify Files. Persona stays aligned with each final URL.
+      const directIdx = [];
+      const uploadIdx = [];
+      selected.forEach((s, i) => {
+        if (s.url && /cdn\.shopify\.com/i.test(s.url) && !s.dataUrl) directIdx.push(i);
+        else uploadIdx.push(i);
+      });
+
+      let hosted = [];
+      let uploadedIds = [];
+      if (uploadIdx.length) {
+        updateProductStatus('Hosting selected images...', productName);
+        log(`Hosting ${uploadIdx.length} image(s) on Shopify...`, 'info');
+        const up = await bg({ action: 'upload_images', sku, images: uploadIdx.map((i) => selected[i]) });
+        hosted = up.urls || [];
+        uploadedIds = up.fileIds || [];
+        if (up.ok) log(`Hosted ${hosted.filter(Boolean).length} image(s)`, 'success');
+        else if (up.configured === false) log('Shopify not configured — using source URLs', 'warn');
+        else log('Host failed — using source URLs' + (up.error ? ': ' + up.error : ''), 'warn');
+      }
+      // Remember uploaded Shopify file IDs (this run + persisted all-time).
+      addUploadedIds(uploadedIds);
+
+      const imageItems = [];
+      directIdx.forEach((i) => imageItems.push({ url: selected[i].url, persona: selected[i].persona || 'neutral' }));
+      uploadIdx.forEach((i, k) => {
+        const u = hosted[k] || selected[i].url;
+        if (u) imageItems.push({ url: u, persona: selected[i].persona || 'neutral' });
+      });
+
+      imageUrls = imageItems.map((it) => it.url);
+      productData.photoItems = imageItems;       // {url, persona} — for CSV gender match
+      if (directIdx.length) log(`${directIdx.length} original image(s) used as-is`, 'success');
+
+      // Metadata scraped from the selected images (alt text) — extra context for Gemini.
+      const metas = selected.map((s) => (s.alt || '').trim()).filter(Boolean);
+      productData.imageMeta = Array.from(new Set(metas)).join('; ').slice(0, 600);
+    } else {
+      log('No images selected for this product', 'info');
+    }
+  }
+  productData.imageUrls = imageUrls;
+
+  if (!isProcessing) {
+    return { asin, sku, name: productName, reviews: 0, images: 0, error: 'stopped' };
+  }
+
+  // Step 5: AI Overview (Google Search) + Lens text as extra review context
+  updateProductStatus('Getting AI Overview...', productName);
+  log('Fetching Google AI Overview...', 'info');
+  let aiOverview = '';
+  try {
+    const ov = await new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { action: 'ai_overview', query: `${productName} ${productData.brand || ''} review` },
+        (response) => resolve(response || {})
+      );
+    });
+    aiOverview = ov.text || '';
+  } catch (e) { /* optional */ }
+  productData.aiOverview = aiOverview;
+  productData.webReference = [aiOverview, lensText].filter(Boolean).join('\n---\n').slice(0, 3000);
+  log(aiOverview ? 'AI Overview collected' : 'No AI Overview (using Lens text)', aiOverview ? 'success' : 'warn');
+
+  // Step 6: Open Gemini (or reuse)
+  if (!geminiTabId) {
+    updateProductStatus('Opening Gemini...', productName);
+    log('Opening Gemini tab...', 'info');
+    
+    const geminiResult = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ action: 'open_gemini' }, resolve);
+    });
+    geminiTabId = geminiResult && geminiResult.tabId;
+    if (!geminiTabId) {
+      throw new Error('Could not open Gemini tab');
+    }
+    await sleep(3000); // Wait for Gemini to load
+    log('Gemini ready', 'success');
+  } else {
+    // New chat for new product
+    await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ action: 'new_gemini_chat', tabId: geminiTabId }, resolve);
+    });
+    await sleep(2000);
+  }
+
+  // Step 4: Generate reviews in batches (count + batch size from Settings)
+  const rMin = settings.min || 25, rMax = settings.max || 100;
+  const totalReviews = Math.floor(Math.random() * (Math.max(rMin, rMax) - rMin + 1)) + rMin;
+  const batchSize = settings.batch || 10;
+  const totalBatches = Math.ceil(totalReviews / batchSize);
+  let allReviews = [];
+  const seenKeys = new Set();  // dedupe review bodies across all batches
+  const seenNames = new Set(); // avoid repeating reviewer names across batches
+  // One "photo review" per selected image — its gender follows the image persona.
+  const personaToGender = (p) => (p === 'female' || p === 'male' || p === 'kids') ? p : 'neutral';
+  const photoQueue = (productData.photoItems || []).map((it) => personaToGender(it.persona));
+
+  updateProductStatus(`Generating ${totalReviews} reviews...`, productName);
+  log(`Target: ${totalReviews} reviews in ${totalBatches} batches${photoQueue.length ? `, ${photoQueue.length} with a photo` : ''}`, 'info');
+
+  for (let batch = 0; batch < totalBatches; batch++) {
+    await waitWhilePaused();
+    if (!isProcessing) break;
+
+    const remaining = totalReviews - allReviews.length;
+    const currentBatchSize = Math.min(batchSize, remaining);
+    const photoGenders = photoQueue.splice(0, Math.min(currentBatchSize, photoQueue.length));
+
+    updateBatchProgress(batch, totalBatches);
+    log(`Batch ${batch + 1}/${totalBatches} (${currentBatchSize} reviews${photoGenders.length ? `, ${photoGenders.length} w/ photo` : ''})...`, 'info');
+
+    // Build and send prompt (feed already-used names so Gemini picks fresh ones)
+    const prompt = buildPrompt(productData, batch, totalBatches, currentBatchSize, Array.from(seenNames), photoGenders);
+    
+    let retries = 0;
+    let batchReviews = null;
+
+    while (retries < 3 && !batchReviews) {
+      try {
+        const geminiResponse = await new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({
+            action: 'send_to_gemini',
+            tabId: geminiTabId,
+            prompt: prompt
+          }, (response) => {
+            if (response?.error) reject(new Error(response.error));
+            else resolve(response);
+          });
+        });
+
+        batchReviews = parseGeminiResponse(geminiResponse.response);
+        
+        if (!batchReviews || batchReviews.length === 0) {
+          throw new Error('Empty response');
+        }
+      } catch (e) {
+        retries++;
+        log(`Batch ${batch + 1} attempt ${retries} failed: ${e.message}`, 'warn');
+        if (retries < 3) {
+          const msg = (e.message || '').toLowerCase();
+          const tabBroken = msg.includes('no response') || msg.includes('connection') ||
+                            msg.includes('port closed') || msg.includes('no tab') ||
+                            msg.includes('timeout');
+          if (tabBroken) {
+            // Self-heal: the Gemini tab is unresponsive/closed — reopen it fresh.
+            log('Gemini unresponsive — reopening tab (self-heal)...', 'warn');
+            await recoverGemini();
+          } else {
+            // Just a bad/empty response — start a clean chat and retry.
+            await new Promise((resolve) => {
+              chrome.runtime.sendMessage({ action: 'new_gemini_chat', tabId: geminiTabId }, resolve);
+            });
+            await sleep(2000);
+          }
+        }
+      }
+    }
+
+    // If the batch failed entirely, repair Gemini before the next batch so one
+    // bad batch doesn't cascade into all the rest failing. Re-queue its photo
+    // slots so we don't lose photo reviews for the selected images.
+    if (!batchReviews || batchReviews.length === 0) {
+      if (photoGenders.length) photoQueue.unshift(...photoGenders);
+      await recoverGemini();
+    }
+
+    if (batchReviews && batchReviews.length > 0) {
+      // Drop reviews that duplicate a body, a reviewer name, or a title already
+      // collected for this product — keeps the set genuinely unique.
+      const uniqueReviews = batchReviews.filter(r => {
+        const bodyKey = (r.review_body || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 60);
+        const nameKey = (r.reviewer_name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const titleKey = (r.review_title || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        if (!bodyKey || seenKeys.has(bodyKey) || (nameKey && seenNames.has(nameKey)) || (titleKey && seenKeys.has('t:' + titleKey))) {
+          return false;
+        }
+        seenKeys.add(bodyKey);
+        if (titleKey) seenKeys.add('t:' + titleKey);
+        if (nameKey) seenNames.add(nameKey);
+        return true;
+      });
+      const dupes = batchReviews.length - uniqueReviews.length;
+      allReviews = allReviews.concat(uniqueReviews);
+      log(`Batch ${batch + 1} done: ${uniqueReviews.length} reviews${dupes ? ` (${dupes} duplicates dropped)` : ''} (total: ${allReviews.length})`, 'success');
+    } else {
+      log(`Batch ${batch + 1} failed after 3 retries, skipping`, 'error');
+      log('Tip: make sure you are logged into Gemini in the opened tab (gemini.google.com).', 'warn');
+    }
+
+    // Cooldown between batches
+    if (batch < totalBatches - 1) {
+      const cooldown = 500 + Math.random() * 1000;
+      await sleep(cooldown);
+
+      // New chat every 3 batches to avoid context issues
+      if ((batch + 1) % 3 === 0) {
+        log('Refreshing Gemini chat...', 'info');
+        await new Promise((resolve) => {
+          chrome.runtime.sendMessage({ action: 'new_gemini_chat', tabId: geminiTabId }, resolve);
+        });
+        await sleep(2000);
+      }
+    }
+  }
+
+  // Step 5: Add this product's reviews to the combined CSV (written once, at the
+  // end of the run, as a single file for the whole batch).
+  if (allReviews.length > 0) {
+    updateProductStatus('Adding reviews to combined CSV...', productName);
+    // SKU is deterministic from the input ASIN — always filled. Pass image items
+    // ({url, persona}) so each photo lands on a same-gender review.
+    const rows = buildCsvRows(allReviews, sku, productData.photoItems || []);
+    runCsvRows.push(...rows);
+    log(`✅ ${allReviews.length} reviews added to the combined CSV (run total: ${runCsvRows.length})`, 'success');
+  } else {
+    log('No reviews generated for this product', 'error');
+  }
+
+  updateOverallProgress(productIndex + 1, totalProducts);
+  return {
+    asin, sku, name: productName,
+    reviews: allReviews.length,
+    images: (productData.imageUrls || []).length,
+    error: allReviews.length === 0 ? 'No reviews generated' : null
+  };
+}
+
+// ============================================================
+// GEMINI RESPONSE PARSER
+// ============================================================
+
+// Escapes raw control characters (newline, tab, CR) that occur INSIDE JSON
+// string literals, while leaving structural whitespace between tokens intact.
+// Other illegal control chars inside strings are dropped.
+function escapeControlCharsInStrings(str) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+
+    if (escaped) {
+      out += ch;       // previous char was a backslash; pass this through verbatim
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      out += ch;
+      continue;
+    }
+
+    if (inString) {
+      if (ch === '\n') out += '\\n';
+      else if (ch === '\r') out += '\\r';
+      else if (ch === '\t') out += '\\t';
+      else if (ch.charCodeAt(0) < 0x20) { /* drop other control chars */ }
+      else out += ch;
+    } else {
+      out += ch; // structural whitespace/tokens — leave untouched
+    }
+  }
+
+  return out;
+}
+
+// Detects characters from non-Latin scripts (Devanagari, Gujarati, Telugu,
+// Tamil, Bengali, Kannada, Malayalam, Arabic, CJK, etc.). Reviews must be fully
+// romanized; if native script slips in, stripping it would leave holes in the
+// sentence, so we reject the whole review instead.
+const NONLATIN_RE = /[؀-ۿ܀-ݏऀ-෿฀-๿぀-ヿ一-鿿가-힯]/;
+
+// Emoji + variation selectors + ZWJ + regional indicators + skin tones.
+const EMOJI_PATTERN = '[\\p{Extended_Pictographic}\\u{1F1E6}-\\u{1F1FF}\\u{1F3FB}-\\u{1F3FF}\\uFE0F\\u200D]';
+const EMOJI_RE_G = new RegExp(EMOJI_PATTERN, 'gu');
+const EMOJI_RE_T = new RegExp(EMOJI_PATTERN, 'u');
+
+function containsEmoji(text) { return EMOJI_RE_T.test(text || ''); }
+function stripEmojis(text) {
+  return String(text || '').replace(EMOJI_RE_G, '').replace(/\s{2,}/g, ' ').trim();
+}
+function capEmojis(text, max) {
+  let n = 0;
+  return String(text || '')
+    .replace(EMOJI_RE_G, (m) => {
+      // Variation selectors / ZWJ / skin-tone modifiers attach to the previous
+      // emoji — don't count them, just keep them if the base was kept.
+      const isModifier = /[️‍]/.test(m) || /[\u{1F3FB}-\u{1F3FF}]/u.test(m);
+      if (isModifier) return n <= max ? m : '';
+      n++;
+      return n <= max ? m : '';
+    })
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// Normalizes typography that makes reviews look pasted/AI or breaks importers:
+// fixes UTF-8 mojibake (â€™), converts smart quotes/dashes to plain ASCII, and
+// removes zero-width / BOM characters. (ZWJ ‍ is left for emoji handling.)
+function cleanText(text) {
+  if (!text) return '';
+  let s = String(text);
+  s = s
+    .replace(/â€™/g, "'").replace(/â€˜/g, "'")
+    .replace(/â€œ/g, '"').replace(/â€/g, '"')
+    .replace(/â€"/g, '-').replace(/â€"/g, '-')
+    .replace(/ /g, ' ');
+  s = s
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"')
+    .replace(/[–—]/g, '-')
+    .replace(/…/g, '...');
+  s = s.replace(/[​‌﻿]/g, '');
+  return s.replace(/[ \t]{2,}/g, ' ').trim();
+}
+
+// Detects any mention of price/money, which rule 7 forbids.
+const PRICE_RE = /(₹|\$\s?\d|\brs\.?\s*\d|\brupees?\b|\bmrp\b|\bprice\b|\bcost\b|\bdiscount\b|\boffer\b|\bdeal\b|\bcheap\b|\bexpensive\b|\bworth the money\b)/i;
+
+// Reviews are displayed on the Dropy store, so any mention of the source
+// marketplace (Amazon etc.) must be rejected.
+const PLATFORM_RE = /\b(amazon|flipkart|myntra|nykaa|meesho|snapdeal|ajio|amzn)\b/i;
+
+// Cleans and validates each review:
+//  - coerces numeric fields to real numbers
+//  - drops reviews containing native (non-Roman) script
+//  - drops reviews that mention price/money (enforced in code, not just prompt)
+//  - drops reviews missing a name, body, or title
+function normalizeReviews(arr) {
+  let emojiBudget = 1; // allow at most ONE emoji-bearing review per batch (~1 in 10-15)
+
+  return arr
+    .filter(r => r && r.reviewer_name && r.review_body)
+    .map(r => {
+      // Clean typography first (mojibake, smart quotes, zero-width).
+      let title = cleanText(r.review_title);
+      let body = cleanText(r.review_body);
+      const name = cleanText(r.reviewer_name);
+
+      // Titles never carry emojis. Bodies: keep 1-2 emojis on at most one
+      // review per batch, strip from the rest.
+      title = stripEmojis(title);
+      if (containsEmoji(body) && emojiBudget > 0) {
+        body = capEmojis(body, 2);
+        emojiBudget--;
+      } else {
+        body = stripEmojis(body);
+      }
+
+      return {
+        ...r,
+        review_title: title,
+        review_body: body,
+        reviewer_name: name,
+        star_rating: Number(r.star_rating) || 5,
+        helpful_votes: Number(r.helpful_votes) || 0,
+        has_photo: r.has_photo === true || r.has_photo === 'true',
+        reviewer_gender: String(r.reviewer_gender || '').toLowerCase().trim()
+      };
+    })
+    .filter(r => {
+      const blob = `${r.review_title} ${r.review_body} ${r.reviewer_name}`;
+      return (
+        r.review_title &&
+        r.review_body &&
+        r.reviewer_name &&
+        !NONLATIN_RE.test(blob) &&
+        !PRICE_RE.test(r.review_body) &&
+        !PRICE_RE.test(r.review_title) &&
+        !PLATFORM_RE.test(blob)
+      );
+    });
+}
+
+function parseGeminiResponse(rawText) {
+  if (!rawText) return null;
+
+  // Try to extract JSON from the response
+  let jsonStr = rawText;
+
+  // Remove markdown code blocks
+  jsonStr = jsonStr.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
+  
+  // Find JSON array
+  const startIdx = jsonStr.indexOf('[');
+  const endIdx = jsonStr.lastIndexOf(']');
+  
+  if (startIdx === -1 || endIdx === -1) return null;
+  
+  jsonStr = jsonStr.substring(startIdx, endIdx + 1);
+
+  // Clean up common issues
+  jsonStr = jsonStr
+    .replace(/,\s*]/g, ']')  // trailing commas
+    .replace(/,\s*}/g, '}'); // trailing commas in objects
+
+  // Escape control chars (newlines/tabs) ONLY when they appear inside a
+  // string literal. Structural whitespace between tokens must be left as-is,
+  // otherwise pretty-printed JSON gets corrupted (e.g. "[\n {" -> "[\\n {").
+  jsonStr = escapeControlCharsInStrings(jsonStr);
+
+  try {
+    const parsed = JSON.parse(jsonStr);
+    if (Array.isArray(parsed)) {
+      return normalizeReviews(parsed);
+    }
+  } catch (e) {
+    // Try fixing common JSON issues
+    try {
+      // Sometimes Gemini adds trailing text
+      const fixedJson = jsonStr.replace(/\}[^}\]]*$/, '}]');
+      const parsed = JSON.parse(fixedJson);
+      if (Array.isArray(parsed)) {
+        return normalizeReviews(parsed);
+      }
+    } catch (e2) {
+      console.error('JSON parse failed:', e2.message);
+    }
+  }
+  
+  return null;
+}
+
+// ============================================================
+// CSV GENERATOR
+// ============================================================
+
+// RFC-4180 CSV escaping: wrap a field in quotes if it has a comma, quote, or
+// newline, and double any internal quotes.
+function csvField(v) {
+  const s = (v === null || v === undefined) ? '' : String(v);
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// Review-import column format:
+// title,body,rating,review_date,reviewer_name,product_sku,picture_urls
+const CSV_HEADERS = ['title', 'body', 'rating', 'review_date', 'reviewer_name', 'product_sku', 'picture_urls'];
+
+// Builds the CSV DATA rows (no header) for ONE product's reviews. Image-to-review
+// matching is per-product, so this runs once per product and the rows are
+// concatenated into a single combined file for the whole run.
+function buildCsvRows(reviews, productSku, imageItems) {
+  // Attach each photo to a has_photo review whose GENDER matches the image's
+  // persona (female photo -> female reviewer, etc.) so picture and reviewer
+  // stay consistent. 'neutral'/'kids' accept any reviewer.
+  const picByIndex = {};
+  const imgs = (imageItems || []).map((x) => (typeof x === 'string' ? { url: x, persona: 'neutral' } : x));
+  if (imgs.length && reviews.length) {
+    const photoIdx = reviews.map((_, i) => i).filter((i) => reviews[i].has_photo);
+    const used = new Set();
+    const genderOf = (i) => (reviews[i].reviewer_gender || '').toLowerCase();
+    const takeMatch = (persona) => {
+      let idx = photoIdx.find((i) => !used.has(i) && (persona === 'neutral' || persona === 'kids' || genderOf(i) === persona));
+      if (idx === undefined) idx = photoIdx.find((i) => !used.has(i)); // any remaining photo review
+      if (idx === undefined) idx = reviews.map((_, i) => i).find((i) => !used.has(i) && !picByIndex[i]); // any review
+      if (idx !== undefined) used.add(idx);
+      return idx;
+    };
+    imgs.forEach((it) => {
+      const idx = takeMatch((it.persona || 'neutral').toLowerCase());
+      if (idx !== undefined) picByIndex[idx] = it.url;
+    });
+  }
+
+  return reviews.map((r, i) => [
+    csvField(r.review_title || ''),
+    csvField(r.review_body || ''),
+    csvField(r.star_rating || 5),
+    csvField(formatReviewDate(r.date)),
+    csvField(r.reviewer_name || ''),
+    csvField(productSku || ''),
+    csvField(picByIndex[i] || '')
+  ].join(','));
+}
+
+// Writes ONE CSV file containing all rows accumulated across the run.
+function writeCombinedCsv(rows, fileName) {
+  const csv = [CSV_HEADERS.join(',')].concat(rows).join('\r\n');
+
+  // Save silently via chrome.downloads (saveAs:false) — no "Save As" prompt.
+  // UTF-8 data URL keeps any emojis intact. Falls back to a Blob download.
+  try {
+    const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+    chrome.runtime.sendMessage({ action: 'save_file', filename: fileName, dataUrl }, (resp) => {
+      if (chrome.runtime.lastError || !resp || !resp.ok) {
+        downloadCsvFallback(csv, fileName);
+      }
+    });
+  } catch (e) {
+    downloadCsvFallback(csv, fileName);
+  }
+}
+
+function downloadCsvFallback(csv, fileName) {
+  try {
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch (e) { /* give up */ }
+}
+
+// Converts a "YYYY-MM-DD" date into the importer's "YYYY-MM-DD 00:00:00 UTC"
+// format. If the date is missing/unparseable, falls back to a random date
+// within the last year so the review_date column is never blank.
+function formatReviewDate(d) {
+  const m = d && String(d).match(/\d{4}-\d{2}-\d{2}/);
+  if (m) return `${m[0]} 00:00:00 UTC`;
+  const past = Date.now() - Math.floor(Math.random() * 365) * 86400000;
+  return `${new Date(past).toISOString().slice(0, 10)} 00:00:00 UTC`;
+}
+
+// ============================================================
+// UI UPDATES
+// ============================================================
+
+function updateOverallProgress(current, total) {
+  const pct = total > 0 ? (current / total) * 100 : 0;
+  document.getElementById('overallProgress').style.width = pct + '%';
+  document.getElementById('overallText').textContent = `Product ${current} / ${total}`;
+}
+
+function updateBatchProgress(current, total) {
+  const pct = total > 0 ? (current / total) * 100 : 0;
+  document.getElementById('batchProgress').style.width = pct + '%';
+  document.getElementById('batchText').textContent = `Batch ${current + 1} / ${total}`;
+}
+
+function updateProductStatus(status, name) {
+  document.getElementById('currentProductStatus').textContent = status;
+  if (name) document.getElementById('currentProductName').textContent = name;
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function classifyResult(r) {
+  if (r.alreadyDone) return 'done';
+  if ((r.reviews || 0) > 0) return 'done';
+  const e = (r.error || '').toLowerCase();
+  if (e.includes('not found') || e.includes('dropy') || e.includes('stopped') || e.includes('blocked')) return 'skipped';
+  return 'error';
+}
+
+function showResults(results) {
+  showStep('step-complete');
+
+  const doneCount = results.filter(r => (r.reviews || 0) > 0 || r.alreadyDone).length;
+  const totalReviews = results.reduce((s, r) => s + (r.reviews || 0), 0);
+  const totalImages = results.reduce((s, r) => s + (r.images || 0), 0);
+  const issues = results.length - doneCount;
+  const elapsed = fmtTime(Date.now() - stats.startTime);
+
+  // Summary metric cards
+  document.getElementById('summaryGrid').innerHTML = `
+    <div class="metric"><div class="metric-value good">${doneCount}/${results.length}</div><div class="metric-label">Products</div></div>
+    <div class="metric"><div class="metric-value">${totalReviews}</div><div class="metric-label">Reviews</div></div>
+    <div class="metric"><div class="metric-value">${totalImages}</div><div class="metric-label">Images</div></div>
+    <div class="metric"><div class="metric-value ${issues ? 'warn' : 'good'}">${issues}</div><div class="metric-label">Issues</div></div>
+  `;
+
+  document.getElementById('resultsCount').textContent = `${results.length} products · ${elapsed}`;
+
+  const labels = { done: '✅ Done', skipped: '⏭ Skipped', error: '⚠️ Error' };
+  const container = document.getElementById('results');
+  container.innerHTML = results.map(r => {
+    const cls = classifyResult(r);
+    const detail = r.alreadyDone
+      ? 'already done (skipped)'
+      : (cls === 'done'
+        ? `${r.reviews} reviews${r.images ? ` · ${r.images} image${r.images > 1 ? 's' : ''}` : ''}`
+        : escapeHtml(r.error || 'no reviews'));
+    return `
+      <div class="result-card">
+        <div>
+          <div class="result-name">${escapeHtml(r.name || r.asin)}</div>
+          <div class="result-count">${escapeHtml(r.asin)} · ${detail}</div>
+        </div>
+        <span class="result-status ${cls}">${labels[cls]}</span>
+      </div>`;
+  }).join('');
+
+  // Offer to clear the images uploaded to Shopify this run.
+  if (uploadedFileIds.length) {
+    clearImagesBtn.classList.remove('hidden');
+    clearImagesBtn.textContent = `🗑 Delete ${uploadedFileIds.length} uploaded image(s) from Shopify`;
+  } else {
+    clearImagesBtn.classList.add('hidden');
+  }
+
+  // Retry: only products that produced no reviews and weren't already done
+  lastFailed = results.filter(r => (r.reviews || 0) === 0 && !r.alreadyDone).map(r => ({ asin: r.asin, sku: r.sku }));
+  if (lastFailed.length) {
+    retryBtn.classList.remove('hidden');
+    retryBtn.textContent = `↻ Retry ${lastFailed.length} failed`;
+  } else {
+    retryBtn.classList.add('hidden');
+  }
+
+  // Charts + save to history
+  renderCharts(results);
+  saveHistory({
+    date: new Date().toLocaleString('en-IN'),
+    total: results.length, done: doneCount, reviews: totalReviews, images: totalImages, issues, elapsed
+  });
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ============================================================
+// DASHBOARD: tabs, settings, per-ASIN table, history, charts
+// ============================================================
+const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, market: 'in,com' };
+let settings = Object.assign({}, SETTINGS_DEFAULTS);
+
+function loadSettings() {
+  try {
+    chrome.storage.local.get(['settings'], (r) => {
+      settings = Object.assign({}, SETTINGS_DEFAULTS, (r && r.settings) || {});
+      applySettingsToForm();
+    });
+  } catch (e) { /* storage unavailable */ }
+}
+function applySettingsToForm() {
+  const set = (id, v) => { const el = document.getElementById(id); if (!el) return; if (el.type === 'checkbox') el.checked = !!v; else el.value = v; };
+  set('setMin', settings.min); set('setMax', settings.max); set('setBatch', settings.batch);
+  set('srcLens', settings.srcLens); set('srcGoogle', settings.srcGoogle); set('srcPinterest', settings.srcPinterest); set('srcAmazon', settings.srcAmazon);
+  set('setMarket', settings.market);
+}
+function saveSettings() {
+  const num = (id, d, lo, hi) => { let v = parseInt((document.getElementById(id) || {}).value, 10); if (isNaN(v)) v = d; return Math.max(lo, Math.min(hi, v)); };
+  const chk = (id) => !!(document.getElementById(id) || {}).checked;
+  settings = {
+    min: num('setMin', 25, 1, 500), max: num('setMax', 100, 1, 500), batch: num('setBatch', 10, 1, 20),
+    srcLens: chk('srcLens'), srcGoogle: chk('srcGoogle'), srcPinterest: chk('srcPinterest'), srcAmazon: chk('srcAmazon'),
+    market: (document.getElementById('setMarket') || {}).value || 'in,com'
+  };
+  if (settings.min > settings.max) { const t = settings.min; settings.min = settings.max; settings.max = t; }
+  try { chrome.storage.local.set({ settings }); } catch (e) {}
+  applySettingsToForm();
+  const s = document.getElementById('settingsSaved'); if (s) { s.textContent = 'Saved ✓'; setTimeout(() => { s.textContent = ''; }, 2000); }
+}
+function marketDomains() {
+  return (settings.market || 'in,com').split(',').map((x) => (x === 'in' ? 'www.amazon.in' : 'www.amazon.com'));
+}
+
+function initTabs() {
+  document.querySelectorAll('.tab-btn').forEach((b) => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach((x) => x.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach((x) => x.classList.remove('active'));
+      b.classList.add('active');
+      const panel = document.getElementById(b.dataset.tab);
+      if (panel) { panel.classList.remove('hidden'); panel.classList.add('active'); }
+      if (b.dataset.tab === 'tab-history') renderHistory();
+      if (b.dataset.tab === 'tab-settings') updateUploadedUi();
+    });
+  });
+}
+
+// --- Per-ASIN status table ---
+function buildAsinTable(items) {
+  const t = document.getElementById('asinTable');
+  if (!t) return;
+  t.innerHTML = items.map((it, i) => `
+    <div class="asin-row" id="arow-${i}">
+      <div><div class="a-name" id="aname-${i}">${escapeHtml(it.asin)}</div><div class="a-sub" id="asub-${i}">${escapeHtml(it.sku)}</div></div>
+      <div class="a-counts" id="acount-${i}"></div>
+      <span class="a-badge queued" id="abadge-${i}">queued</span>
+    </div>`).join('');
+}
+function updateAsinRow(i, status, name, counts) {
+  const badge = document.getElementById('abadge-' + i);
+  if (badge) { badge.className = 'a-badge ' + status; badge.textContent = status; }
+  if (name) { const n = document.getElementById('aname-' + i); if (n) n.textContent = name; }
+  if (counts != null) { const c = document.getElementById('acount-' + i); if (c) c.textContent = counts; }
+}
+
+// --- History (chrome.storage.local) ---
+function saveHistory(entry) {
+  try {
+    chrome.storage.local.get(['history'], (r) => {
+      const h = (r && r.history) || [];
+      h.unshift(entry);
+      chrome.storage.local.set({ history: h.slice(0, 50) });
+    });
+  } catch (e) {}
+}
+function renderHistory() {
+  const el = document.getElementById('historyList');
+  if (!el) return;
+  try {
+    chrome.storage.local.get(['history'], (r) => {
+      const h = (r && r.history) || [];
+      if (!h.length) { el.innerHTML = '<div class="history-empty">No runs yet.</div>'; return; }
+      el.innerHTML = h.map((e) => `
+        <div class="history-card">
+          <div class="h-date">${escapeHtml(e.date)}</div>
+          <div class="h-stats">${e.done}/${e.total} products · ${e.reviews} reviews · ${e.images} images · ${e.issues} issues${e.elapsed ? ' · ' + escapeHtml(e.elapsed) : ''}</div>
+        </div>`).join('');
+    });
+  } catch (e) {}
+}
+
+// --- Charts (CSS bars) on the results screen ---
+function renderCharts(results) {
+  const el = document.getElementById('charts');
+  if (!el) return;
+  const done = results.filter((r) => (r.reviews || 0) > 0);
+  const bar = (label, val, max) => `<div class="bar-row"><span class="bar-label">${escapeHtml(label)}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.round((val / max) * 100)}%"></div></div><span class="bar-val">${val}</span></div>`;
+  let html = '';
+  const top = done.slice().sort((a, b) => (b.reviews || 0) - (a.reviews || 0)).slice(0, 8);
+  if (top.length) {
+    const maxR = Math.max(1, ...top.map((r) => r.reviews || 0));
+    html += `<div class="chart-block"><h4>Reviews per product (top ${top.length})</h4>${top.map((r) => bar(r.name || r.asin, r.reviews || 0, maxR)).join('')}</div>`;
+  }
+  const doneN = done.length;
+  const skippedN = results.filter((r) => (r.reviews || 0) === 0 && /not found|dropy|stopped|blocked/i.test(r.error || '')).length;
+  const errorN = results.length - doneN - skippedN;
+  const maxS = Math.max(1, doneN, skippedN, errorN);
+  html += `<div class="chart-block"><h4>Outcome</h4>${bar('Done', doneN, maxS)}${bar('Skipped', skippedN, maxS)}${bar('Error', errorN, maxS)}</div>`;
+  el.innerHTML = html;
+}
+
+// --- Product reference image shown in the picker ---
+function setProductRef(url, name, fullUrl) {
+  const el = document.getElementById('productRef');
+  if (!el) return;
+  if (!url) { el.innerHTML = ''; return; }
+  const open = fullUrl || url;
+  el.innerHTML =
+    `<div class="ref-label">Actual product (from dropy) — tap to enlarge</div>` +
+    `<a href="${open}" target="_blank" rel="noopener"><img src="${url}"></a>` +
+    `<div class="ref-text"><b>${escapeHtml((name || '').slice(0, 120))}</b></div>`;
+}
+
+// --- Uploaded Shopify images: tracked all-time so they can be deleted later ---
+function addUploadedIds(ids) {
+  ids = (ids || []).filter(Boolean);
+  if (!ids.length) return;
+  uploadedFileIds.push(...ids); // this run (results-screen button)
+  try {
+    chrome.storage.local.get(['uploadedFileIds'], (r) => {
+      const all = (r && r.uploadedFileIds) || [];
+      chrome.storage.local.set({ uploadedFileIds: Array.from(new Set(all.concat(ids))) }, updateUploadedUi);
+    });
+  } catch (e) {}
+}
+function updateUploadedUi() {
+  const el = document.getElementById('uploadedInfo');
+  if (!el) return;
+  try {
+    chrome.storage.local.get(['uploadedFileIds'], (r) => {
+      const all = (r && r.uploadedFileIds) || [];
+      el.textContent = all.length ? `${all.length} image(s) uploaded to Shopify (all runs).` : 'No images uploaded yet.';
+    });
+  } catch (e) {}
+}
+async function deleteAllUploaded() {
+  const all = await new Promise((res) => { try { chrome.storage.local.get(['uploadedFileIds'], (r) => res((r && r.uploadedFileIds) || [])); } catch (e) { res([]); } });
+  if (!all.length) { alert('No uploaded images are tracked.'); return; }
+  if (!confirm(`Delete ALL ${all.length} uploaded image(s) from Shopify Files? This cannot be undone.`)) return;
+  const btn = document.getElementById('deleteAllImagesBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Deleting...'; }
+  const res = await new Promise((r) => chrome.runtime.sendMessage({ action: 'delete_shopify_files', fileIds: all }, (x) => r(x || {})));
+  try { chrome.storage.local.set({ uploadedFileIds: [] }); } catch (e) {}
+  uploadedFileIds = [];
+  updateUploadedUi();
+  if (btn) { btn.disabled = false; btn.textContent = '🗑 Delete ALL uploaded images from Shopify'; }
+  alert(`Deleted ${res.deleted || 0} image(s) from Shopify.`);
+}
+
+// --- Progress: completed ASINs persisted across runs (resume, don't restart) ---
+function loadProgress() {
+  try {
+    chrome.storage.local.get(['doneAsins'], (r) => {
+      doneAsins = new Set((r && r.doneAsins) || []);
+      updateProgressUi();
+    });
+  } catch (e) {}
+}
+function saveProgress() {
+  try { chrome.storage.local.set({ doneAsins: Array.from(doneAsins) }); } catch (e) {}
+}
+function markDone(asin) {
+  if (asin && !doneAsins.has(asin)) { doneAsins.add(asin); saveProgress(); updateProgressUi(); }
+}
+function resetProgress() {
+  doneAsins = new Set();
+  saveProgress();
+  updateProgressUi();
+}
+function updateProgressUi() {
+  const el = document.getElementById('progressInfo');
+  if (el) el.textContent = doneAsins.size ? `${doneAsins.size} ASIN(s) marked done (skipped on re-run)` : 'No completed ASINs yet.';
+}
+
+function initDashboard() {
+  initTabs();
+  loadSettings();
+  loadProgress();
+  const ss = document.getElementById('saveSettingsBtn'); if (ss) ss.addEventListener('click', saveSettings);
+  const ch = document.getElementById('clearHistoryBtn');
+  if (ch) ch.addEventListener('click', () => { try { chrome.storage.local.set({ history: [] }); } catch (e) {} renderHistory(); });
+  const rp = document.getElementById('resetProgressBtn');
+  if (rp) rp.addEventListener('click', () => { if (confirm('Forget all completed ASINs and reprocess them next run?')) resetProgress(); });
+  const da = document.getElementById('deleteAllImagesBtn');
+  if (da) da.addEventListener('click', deleteAllUploaded);
+  updateUploadedUi();
+}
+initDashboard();

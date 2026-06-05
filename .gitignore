@@ -1,0 +1,8 @@
+# Secrets / local config — NEVER commit or share this file
+config.js
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
+node_modules/
