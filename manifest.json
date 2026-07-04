@@ -1,15 +1,16 @@
+
 {
   "manifest_version": 3,
   "name": "Review Generator - Dropy.in",
   "version": "1.0.0",
   "description": "Generate realistic Indian product reviews using Gemini AI for Dropy.in products",
   "permissions": [
-    "sidePanel",
     "activeTab",
     "scripting",
     "tabs",
     "downloads",
-    "storage"
+    "storage",
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "https://gemini.google.com/*",
@@ -23,9 +24,6 @@
     "https://shopify-staged-uploads.storage.googleapis.com/*",
     "https://*.storage.googleapis.com/*"
   ],
-  "side_panel": {
-    "default_path": "sidepanel.html"
-  },
   "background": {
     "service_worker": "background.js"
   },

@@ -2,11 +2,23 @@
 try { importScripts('config.js'); } catch (e) { /* config.js optional */ }
 const ENV = self.ENV || {};
 
-chrome.action.onClicked.addListener((tab) => {
-  chrome.sidePanel.open({ windowId: tab.windowId });
-});
+// Open the app in a FULL browser tab (not a side panel). Clicking the toolbar
+// icon focuses the existing app tab if one is already open, otherwise creates it.
+const APP_URL = chrome.runtime.getURL('sidepanel.html');
 
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+function openApp() {
+  chrome.tabs.query({}, (tabs) => {
+    const existing = (tabs || []).find((t) => t.url && t.url.startsWith(APP_URL));
+    if (existing) {
+      chrome.tabs.update(existing.id, { active: true });
+      if (existing.windowId != null) chrome.windows.update(existing.windowId, { focused: true });
+    } else {
+      chrome.tabs.create({ url: APP_URL });
+    }
+  });
+}
+
+chrome.action.onClicked.addListener(openApp);
 
 // ============================================================
 // DROPY REVIEW SERVER — image upload config
@@ -106,9 +118,14 @@ async function deleteShopifyFiles(fileIds) {
   return { ok: true, deleted };
 }
 
-// One reusable background tab for ALL scraping navigations (dropy search,
-// product, Lens, AI overview) — so we don't spawn a new tab per step.
-let workTabId = null;
+// POOL of reusable background tabs for scraping. A single shared tab would force
+// every source (Lens, Google, Pinterest, Amazon) to run one-at-a-time; the pool
+// lets concurrent runInTab() calls each grab their OWN tab so sources run in
+// PARALLEL. Tabs are reused across calls and all closed at the end of a run. The
+// id set is mirrored to session storage so a service-worker restart can still
+// find and close them (no orphaned tabs).
+const scrapeTabs = new Set(); // every scrape tab we created
+const freeTabs = [];          // subset currently idle & reusable
 
 function tabExists(id) {
   return new Promise((resolve) => {
@@ -117,43 +134,57 @@ function tabExists(id) {
   });
 }
 
-async function ensureWorkTab() {
-  // Chrome routinely kills the service worker between calls, which wipes the
-  // in-memory workTabId. Without recovering it we'd create a NEW tab every time
-  // and leave the old one open forever ("too many tabs"). Persist the id in
-  // session storage so it survives SW restarts and we keep reusing ONE tab.
-  if (workTabId == null) {
-    try { const r = await chrome.storage.session.get('workTabId'); workTabId = (r && r.workTabId) ?? null; } catch (e) {}
+async function loadScrapeTabs() {
+  if (scrapeTabs.size) return;
+  try { const r = await chrome.storage.session.get('scrapeTabs'); ((r && r.scrapeTabs) || []).forEach((id) => scrapeTabs.add(id)); } catch (e) {}
+}
+async function persistScrapeTabs() {
+  try { await chrome.storage.session.set({ scrapeTabs: Array.from(scrapeTabs) }); } catch (e) {}
+}
+
+// Grab an idle tab (reuse a live one, else create). Marks it busy until released.
+async function acquireTab() {
+  await loadScrapeTabs();
+  while (freeTabs.length) {
+    const id = freeTabs.pop();
+    if (await tabExists(id)) return id;
+    scrapeTabs.delete(id); // stale (closed) — drop it
   }
-  if (await tabExists(workTabId)) return workTabId;
-  workTabId = await new Promise((resolve) => {
+  const id = await new Promise((resolve) => {
     chrome.tabs.create({ url: 'about:blank', active: false }, (tab) => resolve(tab.id));
   });
-  try { await chrome.storage.session.set({ workTabId }); } catch (e) {}
-  return workTabId;
+  scrapeTabs.add(id);
+  await persistScrapeTabs();
+  return id;
 }
 
-function closeWorkTab() {
-  if (workTabId != null) {
-    try { chrome.tabs.remove(workTabId); } catch (e) {}
-    workTabId = null;
-  }
-  try { chrome.storage.session.remove('workTabId'); } catch (e) {}
+function releaseTab(id) {
+  if (id != null && scrapeTabs.has(id) && !freeTabs.includes(id)) freeTabs.push(id);
 }
 
-// Navigates the shared work tab to `url`, waits for load (+settle), runs
-// `injectFn` in the page, and returns its result. Resolves null on timeout.
+async function closeAllScrapeTabs() {
+  await loadScrapeTabs();
+  for (const id of scrapeTabs) { try { chrome.tabs.remove(id); } catch (e) {} }
+  scrapeTabs.clear();
+  freeTabs.length = 0;
+  try { await chrome.storage.session.remove('scrapeTabs'); } catch (e) {}
+}
+
+// Navigates a pooled tab to `url`, waits for load (+settle), runs `injectFn` in
+// the page, returns its result, and releases the tab. Resolves null on timeout.
+// Concurrent calls use different pooled tabs, enabling parallel scraping.
 function runInTab(url, injectFn, opts) {
   const settle = (opts && opts.settle) || 1800;
   const timeout = (opts && opts.timeout) || 30000;
   return new Promise(async (resolve) => {
-    const tabId = await ensureWorkTab();
+    const tabId = await acquireTab();
     let done = false;
     const finish = (result) => {
       if (done) return;
       done = true;
       chrome.tabs.onUpdated.removeListener(listener);
       clearTimeout(guard);
+      releaseTab(tabId); // return to the pool for reuse
       resolve(result);
     };
     function listener(tid, info) {
@@ -197,7 +228,15 @@ async function extractDropyProductPage() {
     return null;
   }
   const abs = (u) => (u && u.startsWith('//')) ? ('https:' + u) : u;
-  const sized = (u, w) => { if (!u) return u; return u + (u.includes('?') ? '&' : '?') + 'width=' + w; };
+  const sized = (u, w) => {
+    if (!u) return u;
+    // Drop any existing Shopify _NxN size token so we get a fresh large render
+    // instead of enlarging an already-shrunk thumbnail.
+    u = u.replace(/_(\d{2,4})x(\d{2,4})?(?=\.(?:jpe?g|png|webp)(?:$|[?#]))/i, '');
+    // Replace an existing width param rather than appending a conflicting one.
+    if (/[?&]width=\d+/i.test(u)) return u.replace(/([?&]width)=\d+/i, '$1=' + w);
+    return u + (u.includes('?') ? '&' : '?') + 'width=' + w;
+  };
 
   const data = {};
   const j = ld();
@@ -273,20 +312,21 @@ async function extractDropyProductPage() {
     const finish = (v) => { if (!done) { done = true; resolve(v); } };
     img.onload = () => {
       try {
-        const maxD = 1800; // keep full clarity; only shrink if larger than this
+        const maxD = 2400; // keep full clarity; only shrink if larger than this
         const sc = Math.min(1, maxD / Math.max(img.naturalWidth, img.naturalHeight));
         const cv = document.createElement('canvas');
         cv.width = Math.max(1, Math.round(img.naturalWidth * sc));
         cv.height = Math.max(1, Math.round(img.naturalHeight * sc));
         const ctx = cv.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, 0, 0, cv.width, cv.height);
-        finish({ data: cv.toDataURL('image/jpeg', 0.92), w: img.naturalWidth, h: img.naturalHeight });
+        finish({ data: cv.toDataURL('image/jpeg', 0.95), w: img.naturalWidth, h: img.naturalHeight });
       } catch (e) { finish({ data: '', w: 0, h: 0 }); } // cross-origin -> URL-only
     };
     img.onerror = () => finish({ data: '', w: 0, h: 0 });
     setTimeout(() => finish({ data: '', w: 0, h: 0 }), 12000);
-    img.src = sized(u, 2048); // request a large version from Shopify's CDN
+    img.src = sized(u, 2600); // request a large version from Shopify's CDN
   });
 
   // Loads a URL and pads it onto a WHITE SQUARE canvas with margin. Google Lens
@@ -305,14 +345,15 @@ async function extractDropyProductPage() {
         const ctx = cv.getContext('2d');
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(0, 0, side, side);
+        ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, Math.round((side - w) / 2), Math.round((side - h) / 2), w, h);
-        finish(cv.toDataURL('image/jpeg', 0.92));
+        finish(cv.toDataURL('image/jpeg', 0.95));
       } catch (e) { finish(''); }
     };
     img.onerror = () => finish('');
     setTimeout(() => finish(''), 12000);
-    img.src = sized(u, 1600);
+    img.src = sized(u, 2000);
   });
 
   const gallery = [];
@@ -375,8 +416,14 @@ async function scrapeLensImages() {
   const upscale = (u) => {
     // YouTube: /vi/<id>/<thumb>.jpg -> sddefault (640) — clearer than default.
     u = u.replace(/(i\.?ytimg\.com\/vi\/[^/]+\/)[a-z0-9_]+\.jpg/i, '$1sddefault.jpg');
-    // Generic Shopify/CDN width params -> bump up.
-    u = u.replace(/([?&](?:width|w))=\d+/i, '$1=1200');
+    // Generic CDN size query params (width/w/height/h/size/sz) -> bump way up.
+    u = u.replace(/([?&](?:width|w|height|h|size|sz))=\d+/ig, '$1=2048');
+    // Shopify-style _123x456 (or _123x) filename size token -> drop it to get
+    // the original (largest) render instead of a shrunk thumbnail.
+    u = u.replace(/_(\d{2,4})x(\d{2,4})?(?=\.(?:jpe?g|png|webp)(?:$|[?#]))/i, '');
+    // Google usercontent / ggpht size suffix (=s200, =w200-h200) -> larger.
+    u = u.replace(/=s\d+(-c)?$/i, '=s2048');
+    u = u.replace(/=w\d+-h\d+(-[a-z]+)?$/i, '=w2048');
     return u;
   };
 
@@ -952,8 +999,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'close_scrape_tab') {
-    closeWorkTab();
-    sendResponse({ done: true });
+    (async () => { await closeAllScrapeTabs(); sendResponse({ done: true }); })();
     return true;
   }
 

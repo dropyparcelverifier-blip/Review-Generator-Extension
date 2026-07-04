@@ -16,6 +16,13 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
+  /* Full-page tab: center the column and cap width so it reads well on wide
+     monitors instead of stretching edge-to-edge. */
+  width: 100%;
+  max-width: 1080px;
+  margin: 0 auto;
+  border-left: 1px solid rgba(255,255,255,0.06);
+  border-right: 1px solid rgba(255,255,255,0.06);
 }
 
 .header {

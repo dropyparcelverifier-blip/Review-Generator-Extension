@@ -537,7 +537,6 @@ async function startProcessing() {
   resumeBtn.classList.add('hidden');
 
   const results = [];
-  const generatedAsins = []; // produced reviews this run — marked "done" ONLY after the CSV is written
   const totalProducts = products.length;
   uploadedFileIds = [];
 
@@ -562,58 +561,132 @@ async function startProcessing() {
   buildAsinTable(products);
   startTimer();
 
+  // Build the work list, skipping ASINs already completed in a previous run.
+  const todo = [];
   for (let i = 0; i < totalProducts; i++) {
-    await waitWhilePaused();
-    if (!isProcessing) {
-      log('Processing stopped by user', 'warn');
-      break;
-    }
-
     const item = products[i];
-    updateOverallProgress(i + 1, totalProducts);
-
-    // Resume: skip ASINs already completed in a previous run.
     if (doneAsins.has(item.asin)) {
       updateAsinRow(i, 'done', item.asin, 'already done');
       log(`Skipping ${item.asin} — already done in a previous run`, 'info');
       results.push({ asin: item.asin, sku: item.sku, name: item.asin, reviews: 0, images: 0, alreadyDone: true });
       stats.done++;
       renderMetrics();
+    } else {
+      todo.push({ item, i });
+    }
+  }
+
+  // ============================================================
+  // PHASE 1 — SELECTION (interactive). Pick images for every product
+  // back-to-back. While you pick one product, the NEXT is already being scraped
+  // in the background (1-ahead look-ahead) so its picker opens with no wait.
+  // Text generation is deferred to Phase 2 — you never wait on Gemini here.
+  // ============================================================
+  const setStepTitle = (t) => { const el = document.getElementById('stepTitle'); if (el) el.textContent = t; };
+
+  setStepTitle('Step 1 of 2 · Select Images');
+  const prepared = []; // { item, i, productData, selected } → generated in Phase 2
+  let prefetch = null; // { k, promise } — the next product being scraped ahead
+  for (let k = 0; k < todo.length; k++) {
+    await waitWhilePaused();
+    if (!isProcessing) { log('Stopped during selection', 'warn'); break; }
+
+    const { item, i } = todo[k];
+    updateOverallProgress(k + 1, todo.length);
+    updateAsinRow(i, 'processing', null, 'finding images...');
+    updateProductStatus('Finding product & images...', item.asin);
+    log(`Selecting ${k + 1}/${todo.length}: ${item.asin}`, 'info');
+
+    // Use the prefetched scrape if it's for this product; else scrape now.
+    let data;
+    try {
+      data = (prefetch && prefetch.k === k) ? await prefetch.promise : await prepareProduct(item, i);
+    } catch (e) {
+      data = { skip: true, error: e.message };
+    }
+    prefetch = null;
+
+    // Kick off scraping the NEXT product while you pick this one's images.
+    if (k + 1 < todo.length && isProcessing) {
+      const nxt = todo[k + 1];
+      prefetch = { k: k + 1, promise: prepareProduct(nxt.item, nxt.i).catch((e) => ({ skip: true, error: e.message })) };
+    }
+
+    if (!data || data.skip) {
+      const err = (data && data.error) || 'not found on dropy.in';
+      log(`Skipped ${item.asin}: ${err}`, 'error');
+      updateAsinRow(i, 'skipped', item.asin, err);
+      results.push({ asin: item.asin, sku: item.sku, name: item.asin, reviews: 0, images: 0, error: err });
+      stats.done++; stats.issues++;
+      renderMetrics();
       continue;
     }
 
-    updateAsinRow(i, 'processing');
-    log(`Starting ${i + 1}/${totalProducts}: ${item.asin}`, 'info');
+    // Interactive image pick. Hosting + generation happen in Phase 2.
+    let selected = [];
+    if (data.candidates.length && isProcessing) {
+      log('Select the review images, then click "Upload selected & continue"...', 'info');
+      setProductRef(data.refImg, data.productData.name, data.refFull);
+      selected = await pickImages(data.candidates);
+      setProductRef('', '');
+      const discarded = data.candidates.length - selected.length;
+      log(`${selected.length} image(s) selected → will upload · ${discarded} unselected discarded (not uploaded, no trace)`, selected.length ? 'success' : 'info');
+    }
+    // Free the heavy captured image data (base64 galleries + padded Lens image)
+    // before buffering — Phase 2 only needs the text fields, `lensText`, and the
+    // picked `selected` items. Without this, dozens of buffered products would
+    // hold hundreds of MB of base64 in memory.
+    ['gallery', 'imageData', 'images', 'originalImages', 'image'].forEach((key) => { delete data.productData[key]; });
+
+    prepared.push({ item, i, productData: data.productData, selected });
+    updateAsinRow(i, 'queued', data.productData.name, 'ready — generating in bg');
+  }
+
+  // ============================================================
+  // PHASE 2 — GENERATION (unattended). All picks are done, so you're free.
+  // Reviews generate one product at a time (Gemini is a single tab) and stream
+  // into the combined CSV as they finish.
+  // ============================================================
+  setStepTitle('Step 2 of 2 · Generating Reviews');
+  if (prepared.length && isProcessing) {
+    log(`Selections done — generating reviews for ${prepared.length} product(s) in the background. You can step away.`, 'success');
+  }
+  for (let j = 0; j < prepared.length; j++) {
+    await waitWhilePaused();
+    if (!isProcessing) { log('Stopped during generation', 'warn'); break; }
+
+    const job = prepared[j];
+    updateOverallProgress(j + 1, prepared.length);
+    updateAsinRow(job.i, 'processing', job.productData.name, 'generating...');
+    log(`Generating ${j + 1}/${prepared.length}: ${job.productData.name}`, 'info');
 
     let result;
     try {
-      result = await processProduct(item, i, totalProducts);
+      result = await generateProduct(job);
     } catch (err) {
-      log(`Error processing ${item.asin}: ${err.message}`, 'error');
-      result = { asin: item.asin, sku: item.sku, name: 'Error', reviews: 0, images: 0, error: err.message };
+      log(`Error generating ${job.item.asin}: ${err.message}`, 'error');
+      result = { asin: job.item.asin, sku: job.item.sku, name: job.productData.name || 'Error', reviews: 0, images: 0, error: err.message };
     }
     results.push(result);
-    updateAsinRow(i, classifyResult(result), result.name,
+    updateAsinRow(job.i, classifyResult(result), result.name,
       `${result.reviews || 0} rev${result.images ? ` · ${result.images} img` : ''}`);
 
-    // Don't mark "done" yet — the combined CSV is written once at the end of the
-    // run, so an ASIN is only safe to skip on re-run AFTER its reviews are in
-    // that file. Marking here would lose reviews if the run is interrupted
-    // before the CSV is written. We commit these below, post-write.
-    if ((result.reviews || 0) > 0) generatedAsins.push(item.asin);
+    // Persist rows to storage and mark done AS EACH product finishes, so closing
+    // the panel mid-generation loses nothing and completed ASINs skip on resume
+    // (the file is rewritten from these rows below and on any resume). Only mark
+    // done if the persist actually succeeded — never skip unsaved reviews.
+    if ((result.reviews || 0) > 0) {
+      const persisted = await saveCsvBatch();
+      if (persisted) markDone(job.item.asin);
+    }
 
-    // Update live metrics
     stats.done++;
     stats.reviews += (result.reviews || 0);
     stats.images += (result.images || 0);
     if (result.error || (result.reviews || 0) === 0) stats.issues++;
     renderMetrics();
 
-    // Wait between products
-    if (i < totalProducts - 1 && isProcessing) {
-      log('Cooling down before next product...', 'info');
-      await sleep(1000);
-    }
+    if (j < prepared.length - 1 && isProcessing) await sleep(800);
   }
 
   // Write/overwrite the ONE combined CSV for this batch — same file across
@@ -623,10 +696,8 @@ async function startProcessing() {
   const addedThisRun = csvBatch.rows.length - rowsBefore;
   if (csvBatch.rows.length) {
     writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
-    saveCsvBatch(); // persist so a later resume appends to this same file
+    await saveCsvBatch(); // rows + done were already persisted per-product; refresh once more
     log(`✅ ${csvBatch.fileName} saved — ${addedThisRun} new this run, ${csvBatch.rows.length} reviews total in the file`, 'success');
-    // Safe now to remember these ASINs as done so they're skipped on a re-run.
-    generatedAsins.forEach(markDone);
   }
 
   // Close Gemini tab + the shared scraping tab
@@ -666,12 +737,15 @@ async function recoverGemini() {
   return !!geminiTabId;
 }
 
-async function processProduct(item, productIndex, totalProducts) {
+// PHASE 1 helper: scrape the product on dropy.in and gather review-image
+// candidates. No text generation and no user interaction, so it is safe to run
+// AHEAD of time (prefetch) while the user picks the previous product's images.
+// Returns { productData, candidates, refImg, refFull } or { skip:true, error }.
+async function prepareProduct(item, productIndex) {
   const asin = item.asin;
   const sku = item.sku;
 
   // Step 1: Find the product on dropy.in (search by SKU) and scrape it
-  updateProductStatus('Finding product on dropy.in...', asin);
   log(`Looking up ${sku} on dropy.in...`, 'info');
 
   let productData = await new Promise((resolve) => {
@@ -686,13 +760,10 @@ async function processProduct(item, productIndex, totalProducts) {
   }
 
   if (!productData.name) {
-    log(`Skipped ${asin}: ${productData.error || 'not found on dropy.in'}`, 'error');
-    updateOverallProgress(productIndex + 1, totalProducts);
-    return { asin, sku, name: asin, reviews: 0, images: 0, error: productData.error || 'dropy lookup failed' };
+    return { skip: true, error: productData.error || 'not found on dropy.in' };
   }
 
   const productName = productData.name;
-  updateProductStatus('Found on dropy.in', productName);
   log(`Product: ${productName}`, 'success');
 
   // Step 2: gather REAL user photos from several sources. Each result item is
@@ -704,44 +775,58 @@ async function processProduct(item, productIndex, totalProducts) {
   const webItems = [];
   let lensText = '';
 
-  let lens = {};
-  if (settings.srcLens && isProcessing) {
-    updateProductStatus('Searching Google Lens for real photos...', productName);
-    if (productData.imageData) {
-      log('Searching Google Lens (padded, no-crop) ...', 'info');
-      lens = await bg({ action: 'lens_by_bytes', imageData: productData.imageData });
-    } else if (lensSource) {
-      lens = await bg({ action: 'lens_by_url', imageUrl: lensSource });
-    }
-    lensText = lens.text || '';
-    (lens.items || []).forEach((it) => webItems.push(it));
-    if (lens.searchFileId) addUploadedIds([lens.searchFileId]); // temp search image (clean up later)
-    if (lens.resultUrl) log(`Lens results page: ${lens.resultUrl}`, 'info');
-    if (lens.error) log(`Lens note: ${lens.error}`, 'warn');
-  }
+  // All sources run IN PARALLEL — each uses its own pooled scrape tab in the
+  // background, so total time ≈ the slowest source instead of their sum.
+  const barcode = productData.barcode || '';
+  let amzItems = [];
+  const jobs = [];
 
-  if (settings.srcGoogle && isProcessing) {
+  if (settings.srcLens && isProcessing) jobs.push((async () => {
     try {
-      updateProductStatus('Searching social/review photos...', productName);
+      let lens = {};
+      if (productData.imageData) {
+        log('Searching Google Lens (padded, no-crop) ...', 'info');
+        lens = await bg({ action: 'lens_by_bytes', imageData: productData.imageData });
+      } else if (lensSource) {
+        lens = await bg({ action: 'lens_by_url', imageUrl: lensSource });
+      }
+      lensText = lens.text || '';
+      (lens.items || []).forEach((it) => webItems.push(it));
+      if (lens.searchFileId) addUploadedIds([lens.searchFileId]); // temp search image (clean up later)
+      if (lens.resultUrl) log(`Lens results page: ${lens.resultUrl}`, 'info');
+      if (lens.error) log(`Lens note: ${lens.error}`, 'warn');
+    } catch (e) { /* optional */ }
+  })());
+
+  if (settings.srcGoogle && isProcessing) jobs.push((async () => {
+    try {
       log('Searching Google Images for real review photos...', 'info');
       const gi = await bg({ action: 'google_images', query: `${productName} ${productData.brand || ''} review` });
       (gi.items || []).forEach((it) => webItems.push(it));
     } catch (e) { /* optional */ }
-  }
+  })());
 
-  if (settings.srcPinterest && isProcessing) {
+  if (settings.srcPinterest && isProcessing) jobs.push((async () => {
     try {
-      updateProductStatus('Searching Pinterest...', productName);
       log('Searching Pinterest...', 'info');
       const pin = await bg({ action: 'google_images', query: `${productName} ${productData.brand || ''} site:pinterest.com` });
       (pin.items || []).forEach((it) => webItems.push(it));
     } catch (e) { /* optional */ }
-  }
+  })());
 
-  // Extra search vectors: the ASIN and the barcode (UPC/EAN) are unique IDs that
-  // pull the EXACT product's photos. Only run them if we don't already have
-  // plenty of candidates — saves time when the earlier sources sufficed.
-  const barcode = productData.barcode || '';
+  if (settings.srcAmazon && isProcessing) jobs.push((async () => {
+    try {
+      log('Scraping Amazon customer review images...', 'info');
+      const amz = await bg({ action: 'amazon_review_images', asin, domains: marketDomains() });
+      amzItems = (amz.images || []).map((u) => ({ full: u, thumb: u, ctx: '', ugc: true }));
+      if (amzItems.length) log(`Amazon review photos: ${amzItems.length} (from ${amz.source || 'amazon'})`, 'success');
+    } catch (e) { /* optional */ }
+  })());
+
+  await Promise.all(jobs);
+
+  // Extra search vectors: ASIN + barcode (unique IDs pull the EXACT product).
+  // Run these sequentially AFTER the parallel sources, only if we're still thin.
   if (settings.srcGoogle && isProcessing && webItems.length < 18) {
     for (const q of [asin, barcode].filter(Boolean)) {
       if (!isProcessing || webItems.length >= 18) break;
@@ -751,18 +836,6 @@ async function processProduct(item, productIndex, totalProducts) {
         (r.items || []).forEach((it) => webItems.push(it));
       } catch (e) { /* optional */ }
     }
-  }
-
-  // Amazon CUSTOMER REVIEW photos — genuinely real, inherently relevant.
-  let amzItems = [];
-  if (settings.srcAmazon && isProcessing) {
-    try {
-      updateProductStatus('Getting Amazon review photos...', productName);
-      log('Scraping Amazon customer review images...', 'info');
-      const amz = await bg({ action: 'amazon_review_images', asin, domains: marketDomains() });
-      amzItems = (amz.images || []).map((u) => ({ full: u, thumb: u, ctx: '', ugc: true }));
-      if (amzItems.length) log(`Amazon review photos: ${amzItems.length} (from ${amz.source || 'amazon'})`, 'success');
-    } catch (e) { /* optional */ }
   }
 
   // Relevance (UNIVERSAL): keep web items whose context mentions this product's
@@ -785,12 +858,6 @@ async function processProduct(item, productIndex, totalProducts) {
   const tokens = Array.from(new Set([...brandTokens, ...nameTokens])).slice(0, 12);
   // ASIN / barcode are exact unique IDs — a context containing either is a sure match.
   const idTokens = [norm(asin), norm(barcode)].filter((t) => t && t.length >= 6);
-  const relevant = (ctx) => {
-    const c = norm(ctx);
-    if (!c) return true;                         // no context -> keep
-    if (idTokens.some((t) => c.includes(t))) return true;  // exact ASIN/barcode hit
-    return tokens.length === 0 || tokens.some((t) => c.includes(t));
-  };
 
   // Merge: Amazon review photos lead, then web items.
   //  - "matched"  = context names THIS product (brand/name/ASIN/barcode) -> trusted
@@ -804,9 +871,14 @@ async function processProduct(item, productIndex, totalProducts) {
   webItems.forEach((it) => {
     if (!it || !it.full || seenFull.has(it.full)) return;
     seenFull.add(it.full);
+    const ctxWords = new Set(words(it.ctx));                     // WHOLE words in the context
+    if (!ctxWords.size) { unknown.push(it); return; }            // no context -> can't judge
     const c = norm(it.ctx);
-    if (!c) { unknown.push(it); return; }                       // can't judge
-    if (idTokens.some((t) => c.includes(t)) || tokens.some((t) => c.includes(t))) matched.push(it); // confirmed
+    // ASIN/barcode are long & unique, so a substring hit is safe. Brand/name
+    // tokens must match as WHOLE WORDS — otherwise a short token (e.g. a 3-letter
+    // brand like "bbr", or "7005") matches random substrings inside CDN-URL
+    // hashes and pulls in totally unrelated products (e.g. lotion for springs).
+    if (idTokens.some((t) => c.includes(t)) || tokens.some((t) => ctxWords.has(t))) matched.push(it); // confirmed
     else dropped++;                                              // different product
   });
   matched.sort((a, b) => (b.ugc ? 1 : 0) - (a.ugc ? 1 : 0)); // amazon/ugc first
@@ -825,60 +897,67 @@ async function processProduct(item, productIndex, totalProducts) {
   }
   log(`Candidates ready: ${kept.length} photo(s) (${matched.length} confirmed this product)`, 'info');
 
-  // Step 3: Manual image selection (the run pauses here for you to pick)
+  // Reference image shown large in the picker while choosing.
+  const g0 = (productData.gallery && productData.gallery[0]) || {};
+  const refImg = g0.data || originals[0] || productData.image || '';        // displays reliably
+  const refFull = originals[0] || g0.url || productData.image || refImg;     // full-size on tap
+
+  productData.lensText = lensText; // carried to Phase 2 for the review prompt
+  return { productData, candidates, refImg, refFull };
+}
+
+// PHASE 2 helper: host the picked images, gather AI Overview context, then
+// generate the reviews via Gemini and append them to the combined CSV. Runs
+// unattended after all selections are done. job = { item, productData, selected }.
+async function generateProduct(job) {
+  const { item, productData, selected } = job;
+  const asin = item.asin;
+  const sku = item.sku;
+  const productName = productData.name;
+  const bg = (msg) => new Promise((resolve) => chrome.runtime.sendMessage(msg, (r) => resolve(r || {})));
+
+  // Step 3: Host the selected images on Shopify Files (original cdn.shopify.com
+  // URLs used as-is; the rest re-hosted). Persona stays aligned with each URL.
   let imageUrls = [];
-  if (candidates.length && isProcessing) {
-    log('Select the review images, then click "Upload selected & continue"...', 'info');
-    // Show the ACTUAL product (from dropy) as a large reference while picking.
-    const g0 = (productData.gallery && productData.gallery[0]) || {};
-    const refImg = g0.data || originals[0] || productData.image || '';        // displays reliably
-    const refFull = originals[0] || g0.url || productData.image || refImg;     // full-size on tap
-    setProductRef(refImg, productName, refFull);
-    const selected = await pickImages(candidates);
-    setProductRef('', '');
+  if (selected && selected.length && isProcessing) {
+    // Original Shopify images are already public — used directly. Others are
+    // re-hosted on Shopify Files. Persona stays aligned with each final URL.
+    const directIdx = [];
+    const uploadIdx = [];
+    selected.forEach((s, i) => {
+      if (s.url && /cdn\.shopify\.com/i.test(s.url) && !s.dataUrl) directIdx.push(i);
+      else uploadIdx.push(i);
+    });
 
-    if (selected.length && isProcessing) {
-      // Original Shopify images are already public — used directly. Others are
-      // re-hosted on Shopify Files. Persona stays aligned with each final URL.
-      const directIdx = [];
-      const uploadIdx = [];
-      selected.forEach((s, i) => {
-        if (s.url && /cdn\.shopify\.com/i.test(s.url) && !s.dataUrl) directIdx.push(i);
-        else uploadIdx.push(i);
-      });
-
-      let hosted = [];
-      let uploadedIds = [];
-      if (uploadIdx.length) {
-        updateProductStatus('Hosting selected images...', productName);
-        log(`Hosting ${uploadIdx.length} image(s) on Shopify...`, 'info');
-        const up = await bg({ action: 'upload_images', sku, images: uploadIdx.map((i) => selected[i]) });
-        hosted = up.urls || [];
-        uploadedIds = up.fileIds || [];
-        if (up.ok) log(`Hosted ${hosted.filter(Boolean).length} image(s)`, 'success');
-        else if (up.configured === false) log('Shopify not configured — using source URLs', 'warn');
-        else log('Host failed — using source URLs' + (up.error ? ': ' + up.error : ''), 'warn');
-      }
-      // Remember uploaded Shopify file IDs (this run + persisted all-time).
-      addUploadedIds(uploadedIds);
-
-      const imageItems = [];
-      directIdx.forEach((i) => imageItems.push({ url: selected[i].url, persona: selected[i].persona || 'neutral' }));
-      uploadIdx.forEach((i, k) => {
-        const u = hosted[k] || selected[i].url;
-        if (u) imageItems.push({ url: u, persona: selected[i].persona || 'neutral' });
-      });
-
-      imageUrls = imageItems.map((it) => it.url);
-      productData.photoItems = imageItems;       // {url, persona} — for CSV gender match
-      if (directIdx.length) log(`${directIdx.length} original image(s) used as-is`, 'success');
-
-      // Metadata scraped from the selected images (alt text) — extra context for Gemini.
-      const metas = selected.map((s) => (s.alt || '').trim()).filter(Boolean);
-      productData.imageMeta = Array.from(new Set(metas)).join('; ').slice(0, 600);
-    } else {
-      log('No images selected for this product', 'info');
+    let hosted = [];
+    let uploadedIds = [];
+    if (uploadIdx.length) {
+      updateProductStatus('Hosting selected images...', productName);
+      log(`Hosting ${uploadIdx.length} image(s) on Shopify...`, 'info');
+      const up = await bg({ action: 'upload_images', sku, images: uploadIdx.map((i) => selected[i]) });
+      hosted = up.urls || [];
+      uploadedIds = up.fileIds || [];
+      if (up.ok) log(`Hosted ${hosted.filter(Boolean).length} image(s)`, 'success');
+      else if (up.configured === false) log('Shopify not configured — using source URLs', 'warn');
+      else log('Host failed — using source URLs' + (up.error ? ': ' + up.error : ''), 'warn');
     }
+    // Remember uploaded Shopify file IDs (this run + persisted all-time).
+    addUploadedIds(uploadedIds);
+
+    const imageItems = [];
+    directIdx.forEach((i) => imageItems.push({ url: selected[i].url, persona: selected[i].persona || 'neutral' }));
+    uploadIdx.forEach((i, k) => {
+      const u = hosted[k] || selected[i].url;
+      if (u) imageItems.push({ url: u, persona: selected[i].persona || 'neutral' });
+    });
+
+    imageUrls = imageItems.map((it) => it.url);
+    productData.photoItems = imageItems;       // {url, persona} — for CSV gender match
+    if (directIdx.length) log(`${directIdx.length} original image(s) used as-is`, 'success');
+
+    // Metadata scraped from the selected images (alt text) — extra context for Gemini.
+    const metas = selected.map((s) => (s.alt || '').trim()).filter(Boolean);
+    productData.imageMeta = Array.from(new Set(metas)).join('; ').slice(0, 600);
   }
   productData.imageUrls = imageUrls;
 
@@ -900,7 +979,7 @@ async function processProduct(item, productIndex, totalProducts) {
     aiOverview = ov.text || '';
   } catch (e) { /* optional */ }
   productData.aiOverview = aiOverview;
-  productData.webReference = [aiOverview, lensText].filter(Boolean).join('\n---\n').slice(0, 3000);
+  productData.webReference = [aiOverview, productData.lensText || ''].filter(Boolean).join('\n---\n').slice(0, 3000);
   log(aiOverview ? 'AI Overview collected' : 'No AI Overview (using Lens text)', aiOverview ? 'success' : 'warn');
 
   // Step 6: Open Gemini (or reuse)
@@ -1058,7 +1137,6 @@ async function processProduct(item, productIndex, totalProducts) {
     log('No reviews generated for this product', 'error');
   }
 
-  updateOverallProgress(productIndex + 1, totalProducts);
   return {
     asin, sku, name: productName,
     reviews: allReviews.length,
@@ -1660,8 +1738,14 @@ function loadCsvBatch() {
     catch (e) { resolve(null); }
   });
 }
+// Persists the batch (fileName + all rows so far) and resolves true on success.
+// Returns false if the write failed (e.g. storage quota) so callers can avoid
+// marking an ASIN "done" when its reviews weren't actually saved.
 function saveCsvBatch() {
-  try { chrome.storage.local.set({ csvBatch }); } catch (e) {}
+  return new Promise((resolve) => {
+    try { chrome.storage.local.set({ csvBatch }, () => resolve(!chrome.runtime.lastError)); }
+    catch (e) { resolve(false); }
+  });
 }
 function clearCsvBatch() {
   csvBatch = null;
