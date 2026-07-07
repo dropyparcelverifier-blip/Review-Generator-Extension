@@ -931,7 +931,8 @@ async function prepareProduct(item, productIndex) {
     try {
       log('Searching Pinterest...', 'info');
       const pin = await bg({ action: 'google_images', query: `${productName} ${productData.brand || ''} site:pinterest.com` });
-      (pin.items || []).forEach((it) => webItems.push(it));
+      // Pinterest = user-curated boards -> treat as real UGC.
+      (pin.items || []).forEach((it) => { it.ugc = true; webItems.push(it); });
     } catch (e) { /* optional */ }
   })());
 

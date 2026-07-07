@@ -547,10 +547,18 @@ async function scrapeLensImages() {
     if (!thumb || thumb.startsWith('data:')) return;
     const a = img.closest('a');
     let full = thumb;
-    if (a) { const m = (a.href || '').match(/[?&]imgurl=([^&]+)/); if (m) { try { full = decodeURIComponent(m[1]); } catch (e) {} } }
-    const ref = a ? a.getAttribute('href') : '';
-    const ctx = [img.getAttribute('alt'), img.getAttribute('aria-label'), ref].filter(Boolean).join(' ');
-    push(full, thumb, ref, ctx);
+    let refUrl = a ? (a.getAttribute('href') || '') : '';
+    // Decode Google's redirect params for the real source image + source PAGE url.
+    const mu = refUrl.match(/[?&]imgurl=([^&]+)/); if (mu) { try { full = decodeURIComponent(mu[1]); } catch (e) {} }
+    const mr = refUrl.match(/[?&]imgrefurl=([^&]+)/); if (mr) { try { refUrl = decodeURIComponent(mr[1]); } catch (e) {} }
+    // Google's new image UI shows the SOURCE SITE (Instagram/TikTok/Walmart/…) as
+    // on-screen text near each result rather than in the link. Read that label so
+    // genuine social results get flagged even when the domain isn't in the URL.
+    let label = '';
+    const tile = (a && a.parentElement) || img.parentElement;
+    if (tile) label = ((tile.innerText || tile.textContent || '').replace(/\s+/g, ' ')).slice(0, 120);
+    const ctx = [img.getAttribute('alt'), img.getAttribute('aria-label'), refUrl, label].filter(Boolean).join(' ');
+    push(full, thumb, refUrl + ' ' + label, ctx);
   });
   // imgurl anchors that had no paired <img> (full only).
   document.querySelectorAll('a[href*="imgurl="]').forEach((a) => {
