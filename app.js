@@ -3,6 +3,7 @@
 // ============================================================
 
 let products = [];   // [{ asin, sku }]
+let uploadedFileBase = ''; // base name of the uploaded list — used to name the output CSV
 // ONE combined CSV per batch, persisted across Stop→Continue/resume so all
 // reviews keep going into the SAME file (no duplicate "reviews (1).csv").
 // { fileName, rows: string[] } — rows are accumulated across every run of the batch.
@@ -476,11 +477,24 @@ function buildProducts(asins) {
   return list;
 }
 
+// Base name for the output CSV, derived from the uploaded file (so the CSV is
+// named after your input list / brand). Strips the extension and any characters
+// illegal in a filename.
+function csvBaseFromFile(name) {
+  return String(name || '')
+    .replace(/\.[^.]+$/, '')          // drop extension
+    .replace(/[\\/:*?"<>|]+/g, '_')   // illegal filename chars -> _
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+}
+
 function finalizeUpload(file, parsedCount) {
   if (products.length === 0) {
     alert('No valid ASINs found. The file should list one ASIN per line (e.g. B071HN7KK6).');
     return;
   }
+  uploadedFileBase = csvBaseFromFile(file.name); // name the output CSV after the input file
   const dupes = (parsedCount || products.length) - products.length;
   fileName.textContent = file.name;
   fileCount.textContent = dupes > 0 ? `${products.length} ASINs (${dupes} duplicate${dupes > 1 ? 's' : ''} removed)` : `${products.length} ASINs`;
@@ -582,7 +596,9 @@ async function startProcessing() {
     csvBatch = persisted;
   } else {
     const dateStr = new Date().toISOString().slice(0, 10);
-    csvBatch = { fileName: `reviews_${dateStr}_${Date.now()}.csv`, rows: [], asins: products.map((p) => p.asin) };
+    // Name the CSV after the uploaded file (falls back to a dated name).
+    const fname = uploadedFileBase ? `${uploadedFileBase}.csv` : `reviews_${dateStr}_${Date.now()}.csv`;
+    csvBatch = { fileName: fname, rows: [], asins: products.map((p) => p.asin) };
   }
   // Persisted image selections (by ASIN), so a Stop/close during selection or
   // generation doesn't force you to re-pick — resume jumps straight to generating.

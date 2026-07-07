@@ -93,6 +93,13 @@ eq(G.buildProducts(['B071HN7KK6', 'B071HN7KK6', 'B08XYZ1234']),
 eq(G.buildProducts([]), [], 'buildProducts empty');
 eq(G.buildProducts([null, 'B071HN7KK6', undefined]), [{ asin: 'B071HN7KK6', sku: 'Dropy-B071HN7KK6' }], 'buildProducts skips falsy');
 
+// ===================== csvBaseFromFile =====================
+eq(G.csvBaseFromFile('Skincare.txt'), 'Skincare', 'csvBase strips .txt');
+eq(G.csvBaseFromFile('My Brand.xlsx'), 'My Brand', 'csvBase strips .xlsx, keeps spaces');
+eq(G.csvBaseFromFile('a/b:c*d.csv'), 'a_b_c_d', 'csvBase replaces illegal filename chars');
+eq(G.csvBaseFromFile('noext'), 'noext', 'csvBase no extension');
+eq(G.csvBaseFromFile(''), '', 'csvBase empty');
+
 // ===================== csvField =====================
 eq(G.csvField('plain'), 'plain', 'csvField plain');
 eq(G.csvField('a,b'), '"a,b"', 'csvField comma quoted');
