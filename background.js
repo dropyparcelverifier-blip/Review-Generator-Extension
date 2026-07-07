@@ -494,7 +494,7 @@ async function scrapeLensImages() {
   await wait(700);
 
   // TRUE user-generated content: social / community / video platforms.
-  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd.it|redditmedia|pinimg|pinterest|twimg|twitter|x.com|ytimg|youtube|blogspot|blogger|wordpress|wp.com|medium.com|tumblr|flickr|staticflickr|imgur|quora)/i;
+  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd\.it|redditmedia|pinimg|pinterest|twimg|twitter|x\.com|ytimg|youtube)/i;
   // Shopping / catalog CDNs = listing & white-background model shots — DROP these.
   const SHOPPING = /(media-amazon|ssl-images-amazon|images-amazon|images-na|rukminim|fkcdn|flixcart|nykaa|myntassets|myntra|assets\.ajio|ajio|jiomart|alicdn|aliexpress|ae0?1\.alicdn|ebayimg|scene7|cdn\.shopify|\/cdn\/shop\/)/i;
   const isThumb = (u) => /gstatic\.com|googleusercontent\.com|encrypted-tbn|\/images\?q=tbn|tbn:/i.test(u);
@@ -575,7 +575,7 @@ async function scrapeBingImages() {
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   for (let i = 0; i < 8; i++) { window.scrollBy(0, window.innerHeight); await wait(400); }
 
-  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd.it|redditmedia|pinimg|pinterest|twimg|twitter|x.com|ytimg|youtube|blogspot|blogger|wordpress|wp.com|medium.com|tumblr|flickr|staticflickr|imgur|quora)/i;
+  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd\.it|redditmedia|pinimg|pinterest|twimg|twitter|x\.com|ytimg|youtube)/i;
   const SHOPPING = /(media-amazon|ssl-images-amazon|images-amazon|images-na|rukminim|fkcdn|flixcart|nykaa|myntassets|myntra|assets\.ajio|ajio|jiomart|alicdn|aliexpress|ebayimg|scene7|cdn\.shopify|\/cdn\/shop\/)/i;
   const MARKETING = /(?:^|[/_\-.])(banner|hero|promo|promotion|campaign|advert|advertis|lifestyle|cover|masthead|catalog|catalogue|packshot|render|mockup|template|infographic|swatch|logo|placeholder|sprite|favicon)(?:[/_\-.]|$)/i;
 
