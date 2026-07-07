@@ -444,6 +444,19 @@ function pickImages(items) {
         ? `Showing ${ugcCount} real user photo(s) first (uncheck below to see all ${items.length}). Tap to ✓ keep, ✕ to remove, ⤢ to enlarge.`
         : `No genuine customer photos found — showing product/catalog images (${items.length}). Tap to ✓ keep, ✕ to remove, ⤢ to enlarge.`;
     }
+    // Safety net: the async filters (low-res probe, broken images) can remove
+    // cells after render. If "real photos only" ends up empty, auto-show all so
+    // the grid is never blank while candidates exist.
+    setTimeout(() => {
+      if (imagePicker.classList.contains('hidden')) return;
+      const total = imageGrid.querySelectorAll('.image-cell').length;
+      const realLeft = imageGrid.querySelectorAll('.image-cell.ugc').length;
+      if (ugcBox && ugcBox.checked && realLeft === 0 && total > 0) {
+        ugcBox.checked = false;
+        imageGrid.classList.remove('ugc-only');
+        if (hint) hint.textContent = `No real photos remained — showing all ${total} candidate(s). Tap to ✓ keep, ✕ to remove, ⤢ to enlarge.`;
+      }
+    }, 2600);
     updateProductStatus('Select review images, then click Continue', null);
     pickResolve = (val) => {
       imagePicker.classList.add('hidden');
@@ -1032,11 +1045,12 @@ async function prepareProduct(item, productIndex) {
   // Real user photos first.
   kept.sort((a, b) => (b.ugc ? 1 : 0) - (a.ugc ? 1 : 0));
   const candidates = kept.map((it) => ({ url: it.full, thumb: it.thumb, dataUrl: '', alt: '', ugc: !!it.ugc }));
-  if (!candidates.length) {
-    log('No real photos found — falling back to product images', 'warn');
-    originals.forEach((u) => candidates.push({ url: u, thumb: u, dataUrl: '', alt: '', ugc: false }));
-    (productData.gallery || []).forEach((g) => candidates.push({ url: g.url, thumb: g.data || g.url, dataUrl: g.data, alt: g.alt, ugc: false }));
-  }
+  // ALWAYS add the product's own images (from dropy) as a guaranteed baseline —
+  // marked catalog (ugc:false) — so the picker is never empty even when the web
+  // sources return nothing usable or everything gets filtered out.
+  const seenUrls = new Set(candidates.map((c) => c.url));
+  originals.forEach((u) => { if (u && !seenUrls.has(u)) { seenUrls.add(u); candidates.push({ url: u, thumb: u, dataUrl: '', alt: '', ugc: false }); } });
+  (productData.gallery || []).forEach((g) => { if (g && g.url && !seenUrls.has(g.url)) { seenUrls.add(g.url); candidates.push({ url: g.url, thumb: g.data || g.url, dataUrl: g.data, alt: g.alt, ugc: false }); } });
   const ugcCount = candidates.filter((c) => c.ugc).length;
   log(`Candidates ready: ${kept.length} photo(s) — ${ugcCount} real user photo(s) (${matched.length} confirmed this product)`, 'info');
 
