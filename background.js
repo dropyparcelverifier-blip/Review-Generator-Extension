@@ -207,15 +207,34 @@ async function findDropyProductByAsin(asin) {
     const t = ((document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 400) : '')).toLowerCase();
     return /just a moment|checking your browser|cloudflare|cf-challenge|verify you are human|enable javascript and cookies|attention required/i.test(t);
   };
+  const cands = [];
+  const seen = new Set();
+  const addUrl = (u) => {
+    if (!u) return;
+    const m = String(u).split('?')[0].match(/\/products\/([^/?#]+)/);
+    if (!m) return;
+    const handle = m[1];
+    if (handle && !seen.has(handle)) { seen.add(handle); cands.push({ handle, url: '/products/' + handle }); }
+  };
   try {
-    const r = await fetch('/search/suggest.json?q=' + encodeURIComponent(asin) + '&resources[type]=product&resources[limit]=10', { headers: { Accept: 'application/json' } });
-    if (!r.ok) return challenged() ? { blocked: true } : { none: true };
-    const j = await r.json();
-    const products = (j && j.resources && j.resources.results && j.resources.results.products) || [];
-    if (!products.length) return challenged() ? { blocked: true } : { none: true };
-    const cands = products.slice(0, 8).filter((p) => p && p.handle);
+    // 1) Product links on the loaded /search results page (full-text search —
+    //    finds products even when predictive search misses them). These come first
+    //    so the top result is the fallback if the ASIN can't be auto-confirmed.
+    try { document.querySelectorAll('a[href*="/products/"]').forEach((a) => addUrl(a.getAttribute('href') || '')); } catch (e) {}
+    // 2) Predictive search (often ranks the exact product high).
+    try {
+      const r = await fetch('/search/suggest.json?q=' + encodeURIComponent(asin) + '&resources[type]=product&resources[limit]=10', { headers: { Accept: 'application/json' } });
+      if (r.ok) {
+        const j = await r.json();
+        ((j && j.resources && j.resources.results && j.resources.results.products) || []).forEach((p) => p && addUrl(p.url || (p.handle && '/products/' + p.handle)));
+      }
+    } catch (e) {}
+
+    if (!cands.length) return challenged() ? { blocked: true } : { none: true };
+    const top = cands.slice(0, 10);
+
     // Pass 1 (fast): check each candidate's product JSON for the ASIN.
-    for (const p of cands) {
+    for (const p of top) {
       try {
         const pr = await fetch('/products/' + p.handle + '.js', { headers: { Accept: 'application/json' } });
         if (!pr.ok) continue;
@@ -226,17 +245,17 @@ async function findDropyProductByAsin(asin) {
       } catch (e) { /* try next candidate */ }
     }
     // Pass 2 (stronger): fetch the top few candidates' full product HTML — catches
-    // an ASIN stored in a Shopify metafield / JSON-LD / page content that the .js
-    // endpoint omits.
-    for (const p of cands.slice(0, 3)) {
+    // an ASIN in a Shopify metafield / JSON-LD / page content the .js endpoint omits.
+    for (const p of top.slice(0, 3)) {
       try {
         const hr = await fetch('/products/' + p.handle, { headers: { Accept: 'text/html' } });
         if (!hr.ok) continue;
         if (has(await hr.text())) return { url: p.url, matched: true, via: 'html' };
       } catch (e) { /* try next candidate */ }
     }
-    // No exact ASIN match found — fall back to the top predictive result, flagged.
-    return { url: products[0].url, matched: false };
+    // Couldn't confirm the ASIN — fall back to the top search result, flagged so
+    // the UI shows ⚠ (still the right product in the common single-result case).
+    return { url: cands[0].url, matched: false };
   } catch (e) {
     return challenged() ? { blocked: true } : { error: e.message };
   }
@@ -855,7 +874,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Predictive search (ranks the right product) + ASIN confirmation across
       // candidates, instead of the poorly-ranked full /search page.
       const searchUrl = `https://dropy.in/search?q=${encodeURIComponent(q)}`;
-      const found = await runInTab(searchUrl, findDropyProductByAsin, { settle: 1500, args: [asin] });
+      const found = await runInTab(searchUrl, findDropyProductByAsin, { settle: 2000, args: [asin] });
       if (found && found.blocked) {
         sendResponse({ error: 'dropy.in is showing a Cloudflare check — open dropy.in in a tab, pass the check, then retry', blocked: true, name: '' });
         return;

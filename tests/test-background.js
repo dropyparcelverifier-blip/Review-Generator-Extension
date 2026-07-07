@@ -70,10 +70,14 @@ upscale(big); sized(big, 100);
 ok(Date.now() - t0 < 200, 'regex fast on long input (no catastrophic backtracking)');
 
 // ---- findDropyProductByAsin: predictive search + ASIN confirmation ----
-sandbox.document = { title: '', body: { innerText: '' } };
-// Handle-aware fetch mock: routes /search/suggest.json, /products/<handle>.js, and
+// Handle-aware fetch + DOM mock: `dom` = product handles linked on the search
+// results page; routes /search/suggest.json, /products/<handle>.js, and
 // /products/<handle> (HTML) independently.
-function installFetch({ products = [], suggestOk = true, js = {}, html = {} }) {
+function install({ dom = [], products = [], suggestOk = true, js = {}, html = {}, title = '', bodyText = '' }) {
+  sandbox.document = {
+    title, body: { innerText: bodyText },
+    querySelectorAll: (sel) => (String(sel).includes('/products/') ? dom.map((h) => ({ getAttribute: () => '/products/' + h })) : []),
+  };
   sandbox.fetch = (url) => {
     if (url.includes('/search/suggest.json')) {
       return suggestOk
@@ -88,60 +92,57 @@ function installFetch({ products = [], suggestOk = true, js = {}, html = {} }) {
   };
 }
 (async () => {
+  // Regression: product EXISTS (full search finds it) but predictive search is
+  // empty. Must still be found via the results-page DOM.
+  install({
+    dom: ['one-a-day-womens-petites'], products: [],
+    js: { 'one-a-day-womens-petites': { handle: 'one-a-day-womens-petites', title: 'One A Day', tags: [], variants: [{ sku: 'B0848LNYG2', barcode: '' }] } },
+  });
+  let res = await sandbox.findDropyProductByAsin('B0848LNYG2');
+  eq(res && res.url, '/products/one-a-day-womens-petites', 'found via search-page DOM when predictive search is empty');
+  ok(res && res.matched === true, 'DOM-found product ASIN-matched');
+
   // JSON pass — screenshot scenario: screws ranked first, ASIN in Centrum SKU.
-  installFetch({
-    products: [
-      { handle: 'tjfujie-screws', url: '/products/tjfujie-screws' },
-      { handle: 'centrum-200', url: '/products/centrum-200' },
-    ],
+  install({
+    dom: ['tjfujie-screws', 'centrum-200'], products: [],
     js: {
       'tjfujie-screws': { handle: 'tjfujie-screws', title: 'Tjfujie Screws', tags: [], body_html: 'screws', variants: [{ sku: 'TJ-1', barcode: '' }] },
       'centrum-200': { handle: 'centrum-200', title: 'Centrum Adult Multivitamin', tags: ['vitamins'], body_html: 'multivitamin', variants: [{ sku: 'B09BVYY7XR', barcode: '' }] },
     },
   });
-  let res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
   eq(res && res.url, '/products/centrum-200', 'JSON pass: picks ASIN-matching product, not first (screws)');
   ok(res && res.matched === true && res.via === 'json', 'JSON pass: matched via json');
 
   // HTML pass — ASIN absent from every .js but present in a product's HTML.
-  installFetch({
-    products: [
-      { handle: 'aaa', url: '/products/aaa' },
-      { handle: 'right', url: '/products/right' },
-    ],
-    js: {
-      aaa: { handle: 'aaa', title: 'A', variants: [{ sku: 'X', barcode: '' }] },
-      right: { handle: 'right', title: 'Right Product', variants: [{ sku: 'INTERNAL', barcode: '' }] },
-    },
-    html: {
-      aaa: '<html>nothing relevant here</html>',
-      right: '<html><script type="application/ld+json">{"sku":"B09BVYY7XR"}</script></html>',
-    },
+  install({
+    dom: ['aaa', 'right'], products: [],
+    js: { aaa: { handle: 'aaa', title: 'A', variants: [{ sku: 'X', barcode: '' }] }, right: { handle: 'right', title: 'Right Product', variants: [{ sku: 'INTERNAL', barcode: '' }] } },
+    html: { aaa: '<html>nothing relevant here</html>', right: '<html><script type="application/ld+json">{"sku":"B09BVYY7XR"}</script></html>' },
   });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
   eq(res && res.url, '/products/right', 'HTML pass: finds ASIN in product HTML when absent from .js');
   ok(res && res.matched === true && res.via === 'html', 'HTML pass: matched via html');
 
-  // No match anywhere -> top predictive result, flagged unmatched.
-  installFetch({
-    products: [{ handle: 'a', url: '/products/a' }, { handle: 'b', url: '/products/b' }],
+  // No match anywhere -> top search result, flagged unmatched.
+  install({
+    dom: ['a', 'b'], products: [],
     js: { a: { handle: 'a', variants: [{ sku: 'X' }] }, b: { handle: 'b', variants: [{ sku: 'Y' }] } },
     html: { a: '<html>a</html>', b: '<html>b</html>' },
   });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
-  eq(res && res.url, '/products/a', 'no ASIN match anywhere -> falls back to top predictive result');
+  eq(res && res.url, '/products/a', 'no ASIN match anywhere -> falls back to top search result');
   ok(res && res.matched === false, 'fallback flagged unmatched');
 
-  // Empty predictive results, no challenge -> none.
-  installFetch({ products: [] });
+  // No candidates at all, no challenge -> none.
+  install({ dom: [], products: [] });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
-  ok(res && res.none === true, 'empty predictive results -> none');
+  ok(res && res.none === true, 'no candidates -> none');
 
-  // Cloudflare: suggest not ok + challenge text -> blocked.
-  sandbox.document = { title: 'Just a moment...', body: { innerText: 'Checking your browser before accessing' } };
-  installFetch({ suggestOk: false });
+  // Cloudflare: no candidates + challenge text -> blocked.
+  install({ dom: [], products: [], suggestOk: false, title: 'Just a moment...', bodyText: 'Checking your browser before accessing' });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
-  ok(res && res.blocked === true, 'suggest blocked + challenge text -> blocked');
+  ok(res && res.blocked === true, 'no candidates + challenge text -> blocked');
 
   console.log('\n============ BACKGROUND RESULTS ============');
   if (fails.length) console.log(fails.join('\n') + '\n');
