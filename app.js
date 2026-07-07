@@ -955,7 +955,9 @@ async function prepareProduct(item, productIndex) {
       try {
         log(`Searching ${site}...`, 'info');
         const s = await bg({ action: 'google_images', query: `${baseQ} review site:${site}` });
-        (s.items || []).forEach((it) => webItems.push(it));
+        // Site-scoped social results ARE genuine user posts — flag as real
+        // regardless of URL detection (Google's new UI hides the source domain).
+        (s.items || []).forEach((it) => { it.ugc = true; webItems.push(it); });
       } catch (e) { /* optional */ }
     }
   })());
