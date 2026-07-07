@@ -846,6 +846,11 @@ async function prepareProduct(item, productIndex) {
   let amzItems = [];
   const jobs = [];
 
+  // Bias the web image searches toward genuine user shots (unboxings, in-hand,
+  // real customer photos) rather than catalog/marketing images.
+  const baseQ = `${productName} ${productData.brand || ''}`.trim();
+  const ugcQ = `${baseQ} review unboxing real photo`;
+
   if (settings.srcLens && isProcessing) jobs.push((async () => {
     try {
       let lens = {};
@@ -866,7 +871,7 @@ async function prepareProduct(item, productIndex) {
   if (settings.srcGoogle && isProcessing) jobs.push((async () => {
     try {
       log('Searching Google Images for real review photos...', 'info');
-      const gi = await bg({ action: 'google_images', query: `${productName} ${productData.brand || ''} review` });
+      const gi = await bg({ action: 'google_images', query: ugcQ });
       (gi.items || []).forEach((it) => webItems.push(it));
     } catch (e) { /* optional */ }
   })());
@@ -891,7 +896,7 @@ async function prepareProduct(item, productIndex) {
   if (settings.srcBing && isProcessing) jobs.push((async () => {
     try {
       log('Searching Bing Images...', 'info');
-      const b = await bg({ action: 'bing_images', query: `${productName} ${productData.brand || ''} review` });
+      const b = await bg({ action: 'bing_images', query: ugcQ });
       (b.items || []).forEach((it) => webItems.push(it));
     } catch (e) { /* optional */ }
   })());
@@ -901,7 +906,7 @@ async function prepareProduct(item, productIndex) {
       if (!isProcessing) break;
       try {
         log(`Searching ${site}...`, 'info');
-        const s = await bg({ action: 'google_images', query: `${productName} ${productData.brand || ''} site:${site}` });
+        const s = await bg({ action: 'google_images', query: `${baseQ} review site:${site}` });
         (s.items || []).forEach((it) => webItems.push(it));
       } catch (e) { /* optional */ }
     }
