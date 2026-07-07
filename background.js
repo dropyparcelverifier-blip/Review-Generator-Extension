@@ -206,7 +206,14 @@ function runInTab(url, injectFn, opts) {
 // --- injected: first product link on a dropy.in search results page ---
 function findFirstDropyProduct() {
   const a = document.querySelector('a[href*="/products/"]');
-  return a ? a.getAttribute('href') : null;
+  if (a) return a.getAttribute('href');
+  // No product link — distinguish a Cloudflare challenge/block ("retry later")
+  // from a genuine no-results page ("product absent") so the UI can say which.
+  const t = ((document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 500) : '')).toLowerCase();
+  if (/just a moment|checking your browser|cloudflare|cf-challenge|verify you are human|enable javascript and cookies|attention required/i.test(t)) {
+    return '__BLOCKED__';
+  }
+  return null;
 }
 
 // --- injected: scrape a dropy.in (Shopify) product page. Uses the product JSON
@@ -214,6 +221,14 @@ function findFirstDropyProduct() {
 // image's bytes SAME-ORIGIN (the tab has Cloudflare clearance) so we always get
 // ALL product photos — no logo / recommended-product pollution, no lazy-load gaps.
 async function extractDropyProductPage() {
+  // Bail early if the product page itself is a Cloudflare challenge (no product
+  // structured data and challenge text present) — signal "blocked" to the caller.
+  if (!document.querySelector('script[type="application/ld+json"]') && !document.querySelector('h1')) {
+    const t = ((document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 500) : '')).toLowerCase();
+    if (/just a moment|checking your browser|cloudflare|cf-challenge|verify you are human|enable javascript and cookies|attention required/i.test(t)) {
+      return { blocked: true };
+    }
+  }
   function ld() {
     const scripts = document.querySelectorAll('script[type="application/ld+json"]');
     for (const s of scripts) {
@@ -810,9 +825,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       const searchUrl = `https://dropy.in/search?q=${encodeURIComponent(msg.query)}`;
       const href = await runInTab(searchUrl, findFirstDropyProduct, { settle: 2000 });
+      if (href === '__BLOCKED__') {
+        sendResponse({ error: 'dropy.in is showing a Cloudflare check — open dropy.in in a tab, pass the check, then retry', blocked: true, name: '' });
+        return;
+      }
       if (!href) { sendResponse({ error: 'Product not found on dropy.in', name: '' }); return; }
       const productUrl = href.startsWith('http') ? href : ('https://dropy.in' + href);
       const data = await runInTab(productUrl, extractDropyProductPage, { settle: 1800 });
+      if (data && data.blocked) {
+        sendResponse({ error: 'dropy.in is showing a Cloudflare check — open dropy.in in a tab, pass the check, then retry', blocked: true, name: '' });
+        return;
+      }
       if (!data || !data.name) { sendResponse({ error: 'Could not scrape dropy product', name: '' }); return; }
       data.productUrl = productUrl;
 
