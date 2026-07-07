@@ -732,6 +732,7 @@ async function startProcessing() {
     // (the file is rewritten from these rows below and on any resume). Only mark
     // done if the persist actually succeeded — never skip unsaved reviews.
     if ((result.reviews || 0) > 0) {
+      csvBatch.written = false; // new rows -> the file needs (re)writing at run end
       delete csvBatch.pending[job.item.asin]; // selection consumed — no longer needed
       const persisted = await saveCsvBatch();
       if (persisted) markDone(job.item.asin);
@@ -747,14 +748,18 @@ async function startProcessing() {
   }
 
   // Write/overwrite the ONE combined CSV for this batch — same file across
-  // Stop→Continue/resume (overwrite, never "reviews (1).csv"). Runs even if the
-  // run was stopped early, so partial progress is saved. Only the rows added
-  // this run need committing; the file already holds the carried-over ones.
+  // Stop→Continue/resume (overwrite, never "reviews (1).csv"). Only (re)download
+  // when this run actually ADDED rows, or the file was never written for this
+  // batch (e.g. a prior run crashed before writing). A plain rerun of an
+  // all-already-done batch adds nothing, so it must NOT re-download the old file.
   const addedThisRun = csvBatch.rows.length - rowsBefore;
-  if (csvBatch.rows.length) {
+  if (csvBatch.rows.length && !csvBatch.written) {
     writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
-    await saveCsvBatch(); // rows + done were already persisted per-product; refresh once more
+    csvBatch.written = true;
+    await saveCsvBatch();
     log(`✅ ${csvBatch.fileName} saved — ${addedThisRun} new this run, ${csvBatch.rows.length} reviews total in the file`, 'success');
+  } else if (csvBatch.rows.length) {
+    log(`No new reviews this run — ${csvBatch.fileName} already saved (not re-downloaded)`, 'info');
   }
 
   // Close Gemini tab + the shared scraping tab
@@ -1751,9 +1756,11 @@ function renderCharts(results) {
     const maxR = Math.max(1, ...top.map((r) => r.reviews || 0));
     html += `<div class="chart-block"><h4>Reviews per product (top ${top.length})</h4>${top.map((r) => bar(r.name || r.asin, r.reviews || 0, maxR)).join('')}</div>`;
   }
-  const doneN = done.length;
-  const skippedN = results.filter((r) => (r.reviews || 0) === 0 && /not found|dropy|stopped|blocked/i.test(r.error || '')).length;
-  const errorN = results.length - doneN - skippedN;
+  // Count outcomes exactly as the result cards classify them (so already-done
+  // products count as Done, not Error).
+  const doneN = results.filter((r) => classifyResult(r) === 'done').length;
+  const skippedN = results.filter((r) => classifyResult(r) === 'skipped').length;
+  const errorN = results.filter((r) => classifyResult(r) === 'error').length;
   const maxS = Math.max(1, doneN, skippedN, errorN);
   html += `<div class="chart-block"><h4>Outcome</h4>${bar('Done', doneN, maxS)}${bar('Skipped', skippedN, maxS)}${bar('Error', errorN, maxS)}</div>`;
   el.innerHTML = html;

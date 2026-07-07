@@ -180,6 +180,18 @@ async function run() {
   eq(localStore.doneAsins.sort(), ['A', 'B', 'C'], 'S9 all done after resume');
   ok(!localStore.csvBatch.pending || Object.keys(localStore.csvBatch.pending).length === 0, 'S9 pending fully drained');
 
+  // S10 rerun of an ALL-already-done batch must NOT re-download the file
+  resetStore(); T.setProducts(P('A', 'B')); T.install({});
+  await T.startProcessing();
+  ok(saved.length >= 1, 'S10 first run writes the file');
+  ok(localStore.csvBatch.written === true, 'S10 batch flagged written after first run');
+  // rerun: fresh panel, same products (both already done), same persisted batch
+  T.resetState(); saved.length = 0; T.setProducts(P('A', 'B')); T.install({});
+  await T.startProcessing();
+  s = T.snap();
+  eq(s.prepareCalls, [], 'S10 rerun processes nothing (all done)');
+  eq(saved.length, 0, 'S10 rerun of all-done batch does NOT re-download the file');
+
   // report
   console.log('\n============ ORCHESTRATION RESULTS ============');
   if (fails.length) console.log(fails.join('\n') + '\n');
