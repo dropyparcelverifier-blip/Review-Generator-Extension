@@ -1,0 +1,10 @@
+{
+  "name": "review-generator-extension",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Chrome MV3 extension: generate realistic Indian product reviews for dropy.in via Gemini, with real customer photos and CSV export.",
+  "scripts": {
+    "test": "node tests/test-sidepanel.js && node tests/test-orchestration.js && node tests/test-background.js && node tests/test-parallel.js",
+    "check": "node --check app.js && node --check background.js"
+  }
+}

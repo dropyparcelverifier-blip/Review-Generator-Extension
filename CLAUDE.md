@@ -70,14 +70,23 @@ customer photos and exporting an import-ready CSV.
   ASIN/barcode substring) — short tokens must match as whole words.
 
 ## Testing
-No test framework in-repo. Ad-hoc harnesses load `app.js`/`background.js` in a Node
-`vm` sandbox with stubbed `document`/`chrome` and exercise the pure functions +
-`startProcessing` with mocked I/O. Quick sanity checks:
+Harnesses live in `tests/` and load `app.js`/`background.js` in a Node `vm` sandbox
+with stubbed `document`/`chrome`, exercising the pure functions + the real
+`startProcessing` with mocked I/O (no browser needed). Run everything:
 ```
-node --check app.js && node --check background.js
+npm test        # runs all 4 suites (~143 assertions)
+npm run check   # node --check on app.js + background.js
 ```
-Function declarations attach to the vm global; `const`/`let` module vars do not (test
-via the functions or an appended in-scope driver).
+- `test-sidepanel` — parsing, CSV, filtering, prompts, dedup, emoji/date/text helpers.
+- `test-orchestration` — 2-phase pipeline, prefetch alignment, skips, resume/same-file,
+  Stop, and pick-persistence (drives real `startProcessing`).
+- `test-background` — `dataUrlToBlob`, and the `sized`/`upscale` URL transforms.
+- `test-parallel` — proves sources run concurrently + ASIN-match verification.
+
+Note: function declarations attach to the vm global; `const`/`let` module vars do not
+(test via the functions, or an appended in-scope driver — see `test-orchestration`).
+Injected page scrapers (live DOM) and Shopify/Gemini I/O aren't unit-tested — verify
+those in a real browser.
 
 ## Gotchas
 - `config.js` is git-ignored — verify with `git check-ignore config.js` before any push.
