@@ -9,7 +9,8 @@ let uploadedFileBase = ''; // base name of the uploaded list — used to name th
 // { fileName, rows: string[] } — rows are accumulated across every run of the batch.
 let csvBatch = null;
 let lastFailed = []; // items that failed/were skipped in the last run (for Retry)
-let uploadedFileIds = []; // Shopify Files IDs uploaded this run (for "Clear images")
+let runSearchIds = []; // temp Lens SEARCH images uploaded this run (safe to delete)
+let runReviewIds = [];  // review PHOTOS re-hosted this run (IN USE by the CSV — deleting breaks reviews)
 let doneAsins = new Set(); // ASINs already completed (persisted) — skipped on re-run
 let isProcessing = false;
 let isPaused = false;
@@ -296,16 +297,17 @@ clearLogBtn.addEventListener('click', () => {
   document.getElementById('logArea').innerHTML = '';
 });
 
+// Results-screen cleanup: deletes ONLY this run's temporary Lens search images.
+// Your review photos (in the CSV) are never touched here.
 clearImagesBtn.addEventListener('click', async () => {
-  if (!uploadedFileIds.length) return;
-  if (!confirm(`Delete ${uploadedFileIds.length} uploaded image(s) from Shopify Files? This can't be undone.`)) return;
+  if (!runSearchIds.length) return;
+  if (!confirm(`Delete ${runSearchIds.length} temporary Lens search image(s) from Shopify Files?\n\nYour review photos are NOT affected. Can't be undone.`)) return;
   clearImagesBtn.disabled = true;
   clearImagesBtn.textContent = 'Deleting...';
-  const res = await new Promise((resolve) =>
-    chrome.runtime.sendMessage({ action: 'delete_shopify_files', fileIds: uploadedFileIds }, (r) => resolve(r || {}))
-  );
-  log(`Deleted ${res.deleted || 0} image(s) from Shopify`, res.ok ? 'success' : 'warn');
-  uploadedFileIds = [];
+  const res = await deleteShopifyImages(runSearchIds);
+  await removeFromStore('search', runSearchIds);
+  log(`Deleted ${res.deleted || 0} temporary search image(s) from Shopify`, res.ok ? 'success' : 'warn');
+  runSearchIds = [];
   clearImagesBtn.disabled = false;
   clearImagesBtn.classList.add('hidden');
 });
@@ -582,7 +584,7 @@ async function startProcessing() {
 
   const results = [];
   const totalProducts = products.length;
-  uploadedFileIds = [];
+  runSearchIds = []; runReviewIds = [];
 
   // Resume vs. fresh batch for the combined CSV. The batch is identified by its
   // ASIN list: if the current list overlaps the persisted batch's ASINs (a
@@ -883,7 +885,7 @@ async function prepareProduct(item, productIndex) {
       }
       lensText = lens.text || '';
       (lens.items || []).forEach((it) => webItems.push(it));
-      if (lens.searchFileId) addUploadedIds([lens.searchFileId]); // temp search image (clean up later)
+      if (lens.searchFileId) addUploadedIds([lens.searchFileId], 'search'); // temp search image (safe to clean up)
       if (lens.resultUrl) log(`Lens results page: ${lens.resultUrl}`, 'info');
       if (lens.error) log(`Lens note: ${lens.error}`, 'warn');
     } catch (e) { /* optional */ }
@@ -1056,8 +1058,8 @@ async function generateProduct(job) {
       else if (up.configured === false) log('Shopify not configured — using source URLs', 'warn');
       else log('Host failed — using source URLs' + (up.error ? ': ' + up.error : ''), 'warn');
     }
-    // Remember uploaded Shopify file IDs (this run + persisted all-time).
-    addUploadedIds(uploadedIds);
+    // Review photos — IN USE by the CSV, so tracked separately from temp images.
+    addUploadedIds(uploadedIds, 'review');
 
     const imageItems = [];
     directIdx.forEach((i) => imageItems.push({ url: selected[i].url, persona: selected[i].persona || 'neutral' }));
@@ -1632,10 +1634,10 @@ function showResults(results) {
       </div>`;
   }).join('');
 
-  // Offer to clear the images uploaded to Shopify this run.
-  if (uploadedFileIds.length) {
+  // Offer to clean up only this run's temporary Lens search images (safe).
+  if (runSearchIds.length) {
     clearImagesBtn.classList.remove('hidden');
-    clearImagesBtn.textContent = `🗑 Delete ${uploadedFileIds.length} uploaded image(s) from Shopify`;
+    clearImagesBtn.textContent = `🧹 Delete ${runSearchIds.length} temporary Lens search image(s) (safe — keeps review photos)`;
   } else {
     clearImagesBtn.classList.add('hidden');
   }
@@ -1794,40 +1796,86 @@ function setProductRef(url, name, fullUrl) {
     `<div class="ref-text"><b>${escapeHtml((name || '').slice(0, 120))}</b></div>`;
 }
 
-// --- Uploaded Shopify images: tracked all-time so they can be deleted later ---
-function addUploadedIds(ids) {
+// --- Uploaded Shopify images: tracked all-time by TYPE so cleanup can't nuke
+// live review photos. `search` = temporary Lens search images (safe to delete);
+// `review` = photos used in the CSV (deleting breaks imported reviews). ---
+function normalizeUploads(r) {
+  const store = (r && r.uploadedImages) || {};
+  store.search = store.search || [];
+  store.review = store.review || [];
+  // Migrate the OLD flat key: unknown type -> treat as review (in-use, don't auto-delete).
+  const oldFlat = (r && r.uploadedFileIds) || [];
+  if (oldFlat.length) store.review = Array.from(new Set(store.review.concat(oldFlat)));
+  return store;
+}
+function getUploads() {
+  return new Promise((resolve) => {
+    try { chrome.storage.local.get(['uploadedImages', 'uploadedFileIds'], (r) => resolve(normalizeUploads(r))); }
+    catch (e) { resolve({ search: [], review: [] }); }
+  });
+}
+function setUploads(store) {
+  return new Promise((resolve) => {
+    try { chrome.storage.local.set({ uploadedImages: { search: store.search || [], review: store.review || [] }, uploadedFileIds: [] }, resolve); }
+    catch (e) { resolve(); }
+  });
+}
+function deleteShopifyImages(ids) {
+  return new Promise((r) => chrome.runtime.sendMessage({ action: 'delete_shopify_files', fileIds: ids }, (x) => r(x || {})));
+}
+async function removeFromStore(kind, ids) {
+  const store = await getUploads();
+  const gone = new Set(ids);
+  store[kind] = (store[kind] || []).filter((x) => !gone.has(x));
+  await setUploads(store);
+  updateUploadedUi();
+}
+async function addUploadedIds(ids, kind) {
   ids = (ids || []).filter(Boolean);
   if (!ids.length) return;
-  uploadedFileIds.push(...ids); // this run (results-screen button)
-  try {
-    chrome.storage.local.get(['uploadedFileIds'], (r) => {
-      const all = (r && r.uploadedFileIds) || [];
-      chrome.storage.local.set({ uploadedFileIds: Array.from(new Set(all.concat(ids))) }, updateUploadedUi);
-    });
-  } catch (e) {}
+  const key = kind === 'search' ? 'search' : 'review';
+  (key === 'search' ? runSearchIds : runReviewIds).push(...ids);
+  const store = await getUploads();
+  store[key] = Array.from(new Set(store[key].concat(ids)));
+  await setUploads(store);
+  updateUploadedUi();
 }
 function updateUploadedUi() {
   const el = document.getElementById('uploadedInfo');
   if (!el) return;
-  try {
-    chrome.storage.local.get(['uploadedFileIds'], (r) => {
-      const all = (r && r.uploadedFileIds) || [];
-      el.textContent = all.length ? `${all.length} image(s) uploaded to Shopify (all runs).` : 'No images uploaded yet.';
-    });
-  } catch (e) {}
+  getUploads().then((store) => {
+    el.textContent = (store.review.length || store.search.length)
+      ? `${store.review.length} review photo(s) + ${store.search.length} temp search image(s) on Shopify (all runs).`
+      : 'No images uploaded yet.';
+  });
 }
-async function deleteAllUploaded() {
-  const all = await new Promise((res) => { try { chrome.storage.local.get(['uploadedFileIds'], (r) => res((r && r.uploadedFileIds) || [])); } catch (e) { res([]); } });
-  if (!all.length) { alert('No uploaded images are tracked.'); return; }
-  if (!confirm(`Delete ALL ${all.length} uploaded image(s) from Shopify Files? This cannot be undone.`)) return;
-  const btn = document.getElementById('deleteAllImagesBtn');
+// Safe: delete only temporary Lens search images (never the review photos).
+async function deleteAllSearchImages() {
+  const store = await getUploads();
+  if (!store.search.length) { alert('No temporary search images are tracked.'); return; }
+  if (!confirm(`Delete all ${store.search.length} temporary Lens search image(s) from Shopify Files?\n\nReview photos are NOT affected. Can't be undone.`)) return;
+  const btn = document.getElementById('cleanSearchBtn');
   if (btn) { btn.disabled = true; btn.textContent = 'Deleting...'; }
-  const res = await new Promise((r) => chrome.runtime.sendMessage({ action: 'delete_shopify_files', fileIds: all }, (x) => r(x || {})));
-  try { chrome.storage.local.set({ uploadedFileIds: [] }); } catch (e) {}
-  uploadedFileIds = [];
+  const res = await deleteShopifyImages(store.search);
+  await setUploads(Object.assign(store, { search: [] }));
+  runSearchIds = [];
   updateUploadedUi();
-  if (btn) { btn.disabled = false; btn.textContent = '🗑 Delete ALL uploaded images from Shopify'; }
-  alert(`Deleted ${res.deleted || 0} image(s) from Shopify.`);
+  if (btn) { btn.disabled = false; btn.textContent = '🧹 Delete temporary Lens search images (safe)'; }
+  alert(`Deleted ${res.deleted || 0} temporary search image(s).`);
+}
+// Dangerous: deletes the review photos used in your CSV — breaks imported reviews.
+async function deleteReviewImages() {
+  const store = await getUploads();
+  if (!store.review.length) { alert('No review photos are tracked.'); return; }
+  if (!confirm(`⚠ Delete all ${store.review.length} REVIEW photo(s) from Shopify Files?\n\nThis BREAKS the images in any reviews you already imported (their URLs will 404). Only do this for runs you did NOT import. Cannot be undone.`)) return;
+  const btn = document.getElementById('deleteReviewBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Deleting...'; }
+  const res = await deleteShopifyImages(store.review);
+  await setUploads(Object.assign(store, { review: [] }));
+  runReviewIds = [];
+  updateUploadedUi();
+  if (btn) { btn.disabled = false; btn.textContent = '🗑 Delete review photos (⚠ breaks imported reviews)'; }
+  alert(`Deleted ${res.deleted || 0} review photo(s).`);
 }
 
 // --- Progress: completed ASINs persisted across runs (resume, don't restart) ---
@@ -1886,8 +1934,10 @@ function initDashboard() {
   if (ch) ch.addEventListener('click', () => { try { chrome.storage.local.set({ history: [] }); } catch (e) {} renderHistory(); });
   const rp = document.getElementById('resetProgressBtn');
   if (rp) rp.addEventListener('click', () => { if (confirm('Forget all completed ASINs and reprocess them next run?')) resetProgress(); });
-  const da = document.getElementById('deleteAllImagesBtn');
-  if (da) da.addEventListener('click', deleteAllUploaded);
+  const cs = document.getElementById('cleanSearchBtn');
+  if (cs) cs.addEventListener('click', deleteAllSearchImages);
+  const dr = document.getElementById('deleteReviewBtn');
+  if (dr) dr.addEventListener('click', deleteReviewImages);
   updateUploadedUi();
 }
 initDashboard();
