@@ -396,15 +396,24 @@ async function scrapeLensImages() {
     const t = (e.textContent || '').trim();
     return /^visual matches$/i.test(t) || /exact matches/i.test(t);
   });
-  if (vm) { try { vm.click(); } catch (e) {} await wait(2500); }
+  if (vm) { try { vm.click(); } catch (e) {} await wait(1500); }
 
-  // Scroll deeper to load many more results (more candidates).
-  for (let i = 0; i < 14; i++) { window.scrollBy(0, window.innerHeight); await wait(700); }
+  // Scroll to lazy-load results, but STOP EARLY once the image count stops
+  // growing (results exhausted) — avoids the full fixed scroll time when there
+  // are already plenty of candidates. Caps at 10 passes as a backstop.
+  let prevCount = -1, stable = 0;
+  for (let i = 0; i < 10; i++) {
+    window.scrollBy(0, window.innerHeight);
+    await wait(450);
+    const n = document.querySelectorAll('img').length;
+    if (n <= prevCount) { if (++stable >= 2) break; } else { stable = 0; }
+    prevCount = n;
+  }
   // Click any "more results" / "show more" button if present.
   Array.from(document.querySelectorAll('input[type="button"], button, [role="button"]')).forEach((b) => {
     if (/more results|show more|load more/i.test((b.textContent || b.value || ''))) { try { b.click(); } catch (e) {} }
   });
-  await wait(1200);
+  await wait(700);
 
   // TRUE user-generated content: social / community / video platforms.
   const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd\.it|redditmedia|pinimg|pinterest|twimg|twitter|x\.com|ytimg|youtube)/i;
