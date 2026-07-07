@@ -642,11 +642,21 @@ code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px;
 }
 
 .log-entry {
-  padding: 3px 0;
+  padding: 3px 6px 3px 8px;
   border-bottom: 1px solid rgba(255,255,255,0.03);
+  border-left: 2px solid transparent;
+  /* long URLs (Lens results) must wrap instead of overflowing horizontally */
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
-.log-entry:last-child { border: none; }
+.log-entry:last-child { border-bottom: none; }
+
+/* Subtle colored left-accent per log type (message class is on the inner span). */
+.log-entry:has(.log-success) { border-left-color: rgba(74,222,128,0.5); }
+.log-entry:has(.log-info) { border-left-color: rgba(96,165,250,0.4); }
+.log-entry:has(.log-warn) { border-left-color: rgba(251,191,36,0.6); background: rgba(251,191,36,0.04); }
+.log-entry:has(.log-error) { border-left-color: rgba(248,113,113,0.7); background: rgba(248,113,113,0.05); }
 
 .log-time {
   color: #52525b;
@@ -654,7 +664,7 @@ code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px;
 }
 
 .log-success { color: #4ade80; }
-.log-info { color: #60a5fa; }
+.log-info { color: #93c5fd; }
 .log-warn { color: #fbbf24; }
 .log-error { color: #f87171; }
 
@@ -698,12 +708,86 @@ code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px;
 .result-status.error { color: #f87171; background: rgba(239,68,68,0.1); }
 
 ::-webkit-scrollbar {
-  width: 4px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255,255,255,0.1);
-  border-radius: 2px;
+  background: rgba(255,255,255,0.12);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.22);
+}
+
+/* ============================================================
+   Element states & micro-interactions
+   ============================================================ */
+button, input, select, a { transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease; }
+
+/* Keyboard accessibility: visible focus ring everywhere */
+button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible, .upload-zone:focus-visible {
+  outline: 2px solid #818cf8;
+  outline-offset: 2px;
+}
+
+/* Pressed feedback on the main buttons */
+.btn-primary:active:not(:disabled),
+.btn-secondary:active, .btn-resume:active, .btn-danger:active, .btn-mini:active, .tab-btn:active {
+  transform: translateY(1px);
+}
+
+/* Input focus highlight */
+.setting-row input:focus, #setMarket:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.18);
+}
+
+/* Card hover lift for interactive-feeling lists */
+.history-card, .result-card, .metric {
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.1s ease;
+}
+.history-card:hover, .result-card:hover { border-color: rgba(99,102,241,0.35); background: rgba(99,102,241,0.05); }
+.asin-row { transition: background 0.15s ease; }
+.asin-row:hover { background: rgba(255,255,255,0.03); }
+
+/* Badges: pill weight + processing pulse */
+.a-badge { font-weight: 600; }
+.a-badge.processing { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+/* ============================================================
+   Responsive layout
+   ============================================================ */
+@media (max-width: 720px) {
+  .content { padding: 16px; }
+  .header { padding: 16px; }
+  .tabs { padding: 0 16px; }
+  .metrics, .summary-grid { grid-template-columns: repeat(2, 1fr); }
+  .image-grid {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    grid-auto-rows: 190px;
+  }
+  .image-cell { height: 190px; }
+  .product-ref img { height: 180px; }
+}
+
+@media (max-width: 460px) {
+  .content { padding: 12px; }
+  .header { padding: 12px 14px; }
+  .metrics, .summary-grid { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+  .metric-value { font-size: 17px; }
+  .control-row { flex-wrap: wrap; }
+  .control-row button { flex: 1 1 100%; }
+  .bar-row { grid-template-columns: 70px 1fr 30px; }
+  .setting-row { flex-direction: row; }
+  .tab-btn { padding: 12px 10px; font-size: 12px; }
+  .step-header h2 { font-size: 14px; }
+}
+
+/* Respect reduced-motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
 }
