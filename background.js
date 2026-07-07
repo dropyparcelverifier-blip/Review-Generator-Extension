@@ -191,7 +191,7 @@ function runInTab(url, injectFn, opts) {
       if (tid === tabId && info.status === 'complete') {
         chrome.tabs.onUpdated.removeListener(listener);
         setTimeout(() => {
-          chrome.scripting.executeScript({ target: { tabId }, func: injectFn }, (res) => {
+          chrome.scripting.executeScript({ target: { tabId }, func: injectFn, args: (opts && opts.args) || [] }, (res) => {
             finish(res && res[0] ? res[0].result : null);
           });
         }, settle);
@@ -203,17 +203,42 @@ function runInTab(url, injectFn, opts) {
   });
 }
 
-// --- injected: first product link on a dropy.in search results page ---
-function findFirstDropyProduct() {
-  const a = document.querySelector('a[href*="/products/"]');
-  if (a) return a.getAttribute('href');
-  // No product link — distinguish a Cloudflare challenge/block ("retry later")
-  // from a genuine no-results page ("product absent") so the UI can say which.
-  const t = ((document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 500) : '')).toLowerCase();
-  if (/just a moment|checking your browser|cloudflare|cf-challenge|verify you are human|enable javascript and cookies|attention required/i.test(t)) {
-    return '__BLOCKED__';
+// --- injected (runs on a dropy.in tab): find the product that ACTUALLY matches
+// the ASIN. dropy's full /search page ranks unrelated products first, so instead
+// we use Shopify's PREDICTIVE search (suggest.json — ranks the right product
+// highly) and then confirm by checking each candidate's product JSON for the
+// ASIN in its handle/SKU/barcode/tags/title/description. Returns the matched
+// product's url (or the top candidate flagged unmatched), or blocked/none.
+async function findDropyProductByAsin(asin) {
+  const A = String(asin || '').toUpperCase();
+  const has = (s) => A && String(s || '').toUpperCase().includes(A);
+  const challenged = () => {
+    const t = ((document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 400) : '')).toLowerCase();
+    return /just a moment|checking your browser|cloudflare|cf-challenge|verify you are human|enable javascript and cookies|attention required/i.test(t);
+  };
+  try {
+    const r = await fetch('/search/suggest.json?q=' + encodeURIComponent(asin) + '&resources[type]=product&resources[limit]=10', { headers: { Accept: 'application/json' } });
+    if (!r.ok) return challenged() ? { blocked: true } : { none: true };
+    const j = await r.json();
+    const products = (j && j.resources && j.resources.results && j.resources.results.products) || [];
+    if (!products.length) return challenged() ? { blocked: true } : { none: true };
+    // Prefer the candidate whose product JSON actually contains the ASIN.
+    for (const p of products.slice(0, 8)) {
+      if (!p || !p.handle) continue;
+      try {
+        const pr = await fetch('/products/' + p.handle + '.js', { headers: { Accept: 'application/json' } });
+        if (!pr.ok) continue;
+        const pj = await pr.json();
+        const hay = [pj.handle, pj.title, pj.vendor, pj.body_html, (pj.tags || []).join(' '),
+          (pj.variants || []).map((v) => (v.sku || '') + ' ' + (v.barcode || '')).join(' ')].join(' ');
+        if (has(hay)) return { url: p.url, matched: true };
+      } catch (e) { /* try next candidate */ }
+    }
+    // No exact ASIN match found — fall back to the top predictive result, flagged.
+    return { url: products[0].url, matched: false };
+  } catch (e) {
+    return challenged() ? { blocked: true } : { error: e.message };
   }
-  return null;
 }
 
 // --- injected: scrape a dropy.in (Shopify) product page. Uses the product JSON
@@ -823,14 +848,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === 'dropy_lookup') {
     (async () => {
-      const searchUrl = `https://dropy.in/search?q=${encodeURIComponent(msg.query)}`;
-      const href = await runInTab(searchUrl, findFirstDropyProduct, { settle: 2000 });
-      if (href === '__BLOCKED__') {
+      // Derive the clean ASIN (msg.asin, else parse it out of the query/SKU).
+      const asin = msg.asin || (String(msg.query || '').match(/B0[A-Z0-9]{8}|\d{9}[\dX]/i) || [''])[0];
+      const q = asin || msg.query;
+      // Predictive search (ranks the right product) + ASIN confirmation across
+      // candidates, instead of the poorly-ranked full /search page.
+      const searchUrl = `https://dropy.in/search?q=${encodeURIComponent(q)}`;
+      const found = await runInTab(searchUrl, findDropyProductByAsin, { settle: 1500, args: [asin] });
+      if (found && found.blocked) {
         sendResponse({ error: 'dropy.in is showing a Cloudflare check — open dropy.in in a tab, pass the check, then retry', blocked: true, name: '' });
         return;
       }
-      if (!href) { sendResponse({ error: 'Product not found on dropy.in', name: '' }); return; }
-      const productUrl = href.startsWith('http') ? href : ('https://dropy.in' + href);
+      if (!found || !found.url) { sendResponse({ error: 'Product not found on dropy.in', name: '' }); return; }
+      const productUrl = found.url.startsWith('http') ? found.url : ('https://dropy.in' + found.url);
       const data = await runInTab(productUrl, extractDropyProductPage, { settle: 1800 });
       if (data && data.blocked) {
         sendResponse({ error: 'dropy.in is showing a Cloudflare check — open dropy.in in a tab, pass the check, then retry', blocked: true, name: '' });
@@ -838,6 +868,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (!data || !data.name) { sendResponse({ error: 'Could not scrape dropy product', name: '' }); return; }
       data.productUrl = productUrl;
+      data.dropyMatched = !!(found && found.matched); // ASIN confirmed in the product JSON
 
       // Get the ORIGINAL, untouched image files from Shopify's public product
       // JSON on the myshopify domain (cdn.shopify.com URLs — no Cloudflare, no

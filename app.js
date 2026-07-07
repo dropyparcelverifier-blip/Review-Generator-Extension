@@ -772,19 +772,13 @@ async function prepareProduct(item, productIndex) {
   const asin = item.asin;
   const sku = item.sku;
 
-  // Step 1: Find the product on dropy.in (search by SKU) and scrape it
-  log(`Looking up ${sku} on dropy.in...`, 'info');
+  // Step 1: Find the product on dropy.in via predictive search matched to the
+  // ASIN (background verifies the ASIN against candidates' product JSON).
+  log(`Looking up ${asin} on dropy.in...`, 'info');
 
-  let productData = await new Promise((resolve) => {
-    chrome.runtime.sendMessage({ action: 'dropy_lookup', query: sku }, (response) => resolve(response || {}));
+  const productData = await new Promise((resolve) => {
+    chrome.runtime.sendMessage({ action: 'dropy_lookup', query: sku, asin }, (response) => resolve(response || {}));
   });
-  // Fallback: try the plain ASIN as the search query
-  if (!productData.name) {
-    const alt = await new Promise((resolve) => {
-      chrome.runtime.sendMessage({ action: 'dropy_lookup', query: asin }, (response) => resolve(response || {}));
-    });
-    if (alt && alt.name) productData = alt;
-  }
 
   if (!productData.name) {
     return { skip: true, error: productData.error || 'not found on dropy.in' };
@@ -793,13 +787,12 @@ async function prepareProduct(item, productIndex) {
   const productName = productData.name;
   log(`Product: ${productName}`, 'success');
 
-  // VERIFY the dropy result actually matches the requested ASIN. Dropy stores the
-  // source ASIN in the product handle / SKU / description, so if the ASIN appears
-  // in any of those the match is confirmed. Guards against scraping a wrong /
-  // recommended product when dropy has no real match for this ASIN.
+  // VERIFY the match. The background already confirmed the ASIN against each
+  // candidate's product JSON (dropyMatched); as a backstop we also check the
+  // scraped fields. Guards against scraping a wrong/recommended product.
   const hay = [productData.productUrl, productData.sku, productData.barcode, productData.name, productData.full_description, productData.short_description]
     .filter(Boolean).join(' ').toUpperCase();
-  productData.asinVerified = hay.includes(String(asin).toUpperCase());
+  productData.asinVerified = productData.dropyMatched === true || hay.includes(String(asin).toUpperCase());
   if (!productData.asinVerified) {
     if (settings.strictMatch) {
       log(`Skipped ${asin}: dropy result "${productName}" doesn't match this ASIN (strict match on)`, 'error');

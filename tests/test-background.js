@@ -69,7 +69,56 @@ const t0 = Date.now();
 upscale(big); sized(big, 100);
 ok(Date.now() - t0 < 200, 'regex fast on long input (no catastrophic backtracking)');
 
-console.log('\n============ BACKGROUND RESULTS ============');
-if (fails.length) console.log(fails.join('\n') + '\n');
-console.log(`PASS ${pass}  FAIL ${fail}`);
-process.exit(fail ? 1 : 0);
+// ---- findDropyProductByAsin: predictive search + ASIN confirmation ----
+sandbox.document = { title: '', body: { innerText: '' } };
+function routeFetch(routes) {
+  sandbox.fetch = (url) => {
+    const key = Object.keys(routes).find((k) => url.includes(k));
+    if (!key) return Promise.resolve({ ok: false });
+    const v = routes[key];
+    if (v === '__notok__') return Promise.resolve({ ok: false });
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(v) });
+  };
+}
+(async () => {
+  const suggest = (products) => ({ 'search/suggest.json': { resources: { results: { products } } } });
+
+  // Screenshot scenario: screws ranked first, ASIN lives in the Centrum SKU.
+  routeFetch(Object.assign(
+    suggest([
+      { handle: 'tjfujie-screws', url: '/products/tjfujie-screws' },
+      { handle: 'centrum-adult-multivitamin-200-tablets', url: '/products/centrum-adult-multivitamin-200-tablets' },
+    ]),
+    { 'tjfujie-screws.js': { handle: 'tjfujie-screws', title: 'Tjfujie Screws', tags: [], body_html: 'screws', variants: [{ sku: 'TJ-1', barcode: '' }] } },
+    { 'centrum-adult-multivitamin-200-tablets.js': { handle: 'centrum-adult-multivitamin-200-tablets', title: 'Centrum Adult Multivitamin', tags: ['vitamins'], body_html: 'multivitamin', variants: [{ sku: 'B09BVYY7XR', barcode: '' }] } },
+  ));
+  let res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  eq(res && res.url, '/products/centrum-adult-multivitamin-200-tablets', 'picks ASIN-matching product, NOT the first (screws)');
+  ok(res && res.matched === true, 'match flagged verified');
+
+  // No candidate contains the ASIN -> top result, unmatched
+  routeFetch(Object.assign(
+    suggest([{ handle: 'a', url: '/products/a' }, { handle: 'b', url: '/products/b' }]),
+    { 'a.js': { handle: 'a', title: 'A', variants: [{ sku: 'X', barcode: '' }] } },
+    { 'b.js': { handle: 'b', title: 'B', variants: [{ sku: 'Y', barcode: '' }] } },
+  ));
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  eq(res && res.url, '/products/a', 'no ASIN match -> falls back to top predictive result');
+  ok(res && res.matched === false, 'fallback flagged unmatched');
+
+  // Empty predictive results, no challenge -> none
+  routeFetch(suggest([]));
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  ok(res && res.none === true, 'empty predictive results -> none');
+
+  // Cloudflare: suggest not ok + challenge text -> blocked
+  sandbox.document = { title: 'Just a moment...', body: { innerText: 'Checking your browser before accessing' } };
+  routeFetch({ 'search/suggest.json': '__notok__' });
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  ok(res && res.blocked === true, 'suggest blocked + challenge text -> blocked');
+
+  console.log('\n============ BACKGROUND RESULTS ============');
+  if (fails.length) console.log(fails.join('\n') + '\n');
+  console.log(`PASS ${pass}  FAIL ${fail}`);
+  process.exit(fail ? 1 : 0);
+})();
