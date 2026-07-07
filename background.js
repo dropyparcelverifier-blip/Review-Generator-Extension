@@ -4,7 +4,7 @@ const ENV = self.ENV || {};
 
 // Open the app in a FULL browser tab (not a side panel). Clicking the toolbar
 // icon focuses the existing app tab if one is already open, otherwise creates it.
-const APP_URL = chrome.runtime.getURL('sidepanel.html');
+const APP_URL = chrome.runtime.getURL('app.html');
 
 function openApp() {
   chrome.tabs.query({}, (tabs) => {

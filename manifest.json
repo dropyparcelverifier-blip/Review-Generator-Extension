@@ -2,7 +2,7 @@
 {
   "manifest_version": 3,
   "name": "Review Generator - Dropy.in",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Generate realistic Indian product reviews using Gemini AI for Dropy.in products",
   "permissions": [
     "activeTab",

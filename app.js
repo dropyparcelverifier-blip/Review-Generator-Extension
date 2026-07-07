@@ -554,6 +554,9 @@ async function startProcessing() {
     const dateStr = new Date().toISOString().slice(0, 10);
     csvBatch = { fileName: `reviews_${dateStr}_${Date.now()}.csv`, rows: [], asins: products.map((p) => p.asin) };
   }
+  // Persisted image selections (by ASIN), so a Stop/close during selection or
+  // generation doesn't force you to re-pick — resume jumps straight to generating.
+  if (!csvBatch.pending || typeof csvBatch.pending !== 'object') csvBatch.pending = {};
   const rowsBefore = csvBatch.rows.length; // rows carried over from earlier runs of this batch
   if (rowsBefore) log(`Resuming batch — appending to ${csvBatch.fileName} (${rowsBefore} review(s) already in it)`, 'info');
 
@@ -593,6 +596,17 @@ async function startProcessing() {
 
     const { item, i } = todo[k];
     updateOverallProgress(k + 1, todo.length);
+
+    // Restore a previously-saved selection (from an interrupted run) — skip the
+    // re-scrape and re-pick entirely and hand it straight to Phase 2.
+    const savedPick = csvBatch.pending[item.asin];
+    if (savedPick && savedPick.productData) {
+      log(`Restored your earlier selection for ${item.asin} — no re-scrape needed`, 'info');
+      updateAsinRow(i, 'queued', savedPick.productData.name || item.asin, 'ready (restored)');
+      prepared.push({ item, i, productData: savedPick.productData, selected: savedPick.selected || [] });
+      continue;
+    }
+
     updateAsinRow(i, 'processing', null, 'finding images...');
     updateProductStatus('Finding product & images...', item.asin);
     log(`Selecting ${k + 1}/${todo.length}: ${item.asin}`, 'info');
@@ -606,10 +620,14 @@ async function startProcessing() {
     }
     prefetch = null;
 
-    // Kick off scraping the NEXT product while you pick this one's images.
-    if (k + 1 < todo.length && isProcessing) {
-      const nxt = todo[k + 1];
-      prefetch = { k: k + 1, promise: prepareProduct(nxt.item, nxt.i).catch((e) => ({ skip: true, error: e.message })) };
+    // Kick off scraping the NEXT product that ISN'T already restored-from-pending
+    // (those need no scrape) while you pick this one's images.
+    {
+      let j = k + 1;
+      while (j < todo.length && csvBatch.pending[todo[j].item.asin]) j++;
+      if (j < todo.length && isProcessing) {
+        prefetch = { k: j, promise: prepareProduct(todo[j].item, todo[j].i).catch((e) => ({ skip: true, error: e.message })) };
+      }
     }
 
     if (!data || data.skip) {
@@ -623,10 +641,14 @@ async function startProcessing() {
     }
 
     // Interactive image pick. Hosting + generation happen in Phase 2.
+    const unverified = data.productData.asinVerified === false;
     let selected = [];
     if (data.candidates.length && isProcessing) {
       log('Select the review images, then click "Upload selected & continue"...', 'info');
-      setProductRef(data.refImg, data.productData.name, data.refFull);
+      const refName = unverified
+        ? `⚠ UNVERIFIED — is this ${item.asin}?  ${data.productData.name}`
+        : data.productData.name;
+      setProductRef(data.refImg, refName, data.refFull);
       selected = await pickImages(data.candidates);
       setProductRef('', '');
       const discarded = data.candidates.length - selected.length;
@@ -638,8 +660,12 @@ async function startProcessing() {
     // hold hundreds of MB of base64 in memory.
     ['gallery', 'imageData', 'images', 'originalImages', 'image'].forEach((key) => { delete data.productData[key]; });
 
+    // Persist this selection so a Stop/close before generation doesn't lose it.
+    csvBatch.pending[item.asin] = { productData: data.productData, selected };
+    await saveCsvBatch();
+
     prepared.push({ item, i, productData: data.productData, selected });
-    updateAsinRow(i, 'queued', data.productData.name, 'ready — generating in bg');
+    updateAsinRow(i, 'queued', data.productData.name, unverified ? '⚠ unverified — ready' : 'ready — generating in bg');
   }
 
   // ============================================================
@@ -676,6 +702,7 @@ async function startProcessing() {
     // (the file is rewritten from these rows below and on any resume). Only mark
     // done if the persist actually succeeded — never skip unsaved reviews.
     if ((result.reviews || 0) > 0) {
+      delete csvBatch.pending[job.item.asin]; // selection consumed — no longer needed
       const persisted = await saveCsvBatch();
       if (persisted) markDone(job.item.asin);
     }
@@ -765,6 +792,21 @@ async function prepareProduct(item, productIndex) {
 
   const productName = productData.name;
   log(`Product: ${productName}`, 'success');
+
+  // VERIFY the dropy result actually matches the requested ASIN. Dropy stores the
+  // source ASIN in the product handle / SKU / description, so if the ASIN appears
+  // in any of those the match is confirmed. Guards against scraping a wrong /
+  // recommended product when dropy has no real match for this ASIN.
+  const hay = [productData.productUrl, productData.sku, productData.barcode, productData.name, productData.full_description, productData.short_description]
+    .filter(Boolean).join(' ').toUpperCase();
+  productData.asinVerified = hay.includes(String(asin).toUpperCase());
+  if (!productData.asinVerified) {
+    if (settings.strictMatch) {
+      log(`Skipped ${asin}: dropy result "${productName}" doesn't match this ASIN (strict match on)`, 'error');
+      return { skip: true, error: `dropy result doesn't match ASIN ${asin} (possible wrong product)` };
+    }
+    log(`⚠ Couldn't confirm "${productName}" matches ${asin} — check the reference image is the right product`, 'warn');
+  }
 
   // Step 2: gather REAL user photos from several sources. Each result item is
   // { full, thumb, ctx, ugc } — we DISPLAY the thumb (loads reliably) and UPLOAD
@@ -1549,7 +1591,7 @@ function sleep(ms) {
 // ============================================================
 // DASHBOARD: tabs, settings, per-ASIN table, history, charts
 // ============================================================
-const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, market: 'in,com' };
+const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, market: 'in,com', strictMatch: false };
 let settings = Object.assign({}, SETTINGS_DEFAULTS);
 
 function loadSettings() {
@@ -1565,6 +1607,7 @@ function applySettingsToForm() {
   set('setMin', settings.min); set('setMax', settings.max); set('setBatch', settings.batch);
   set('srcLens', settings.srcLens); set('srcGoogle', settings.srcGoogle); set('srcPinterest', settings.srcPinterest); set('srcAmazon', settings.srcAmazon);
   set('setMarket', settings.market);
+  set('strictMatch', settings.strictMatch);
 }
 function saveSettings() {
   const num = (id, d, lo, hi) => { let v = parseInt((document.getElementById(id) || {}).value, 10); if (isNaN(v)) v = d; return Math.max(lo, Math.min(hi, v)); };
@@ -1572,7 +1615,8 @@ function saveSettings() {
   settings = {
     min: num('setMin', 25, 1, 500), max: num('setMax', 100, 1, 500), batch: num('setBatch', 10, 1, 20),
     srcLens: chk('srcLens'), srcGoogle: chk('srcGoogle'), srcPinterest: chk('srcPinterest'), srcAmazon: chk('srcAmazon'),
-    market: (document.getElementById('setMarket') || {}).value || 'in,com'
+    market: (document.getElementById('setMarket') || {}).value || 'in,com',
+    strictMatch: chk('strictMatch')
   };
   if (settings.min > settings.max) { const t = settings.min; settings.min = settings.max; settings.max = t; }
   try { chrome.storage.local.set({ settings }); } catch (e) {}
