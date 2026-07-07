@@ -872,6 +872,25 @@ async function prepareProduct(item, productIndex) {
     } catch (e) { /* optional */ }
   })());
 
+  if (settings.srcBing && isProcessing) jobs.push((async () => {
+    try {
+      log('Searching Bing Images...', 'info');
+      const b = await bg({ action: 'bing_images', query: `${productName} ${productData.brand || ''} review` });
+      (b.items || []).forEach((it) => webItems.push(it));
+    } catch (e) { /* optional */ }
+  })());
+
+  if (settings.srcSocial && isProcessing) jobs.push((async () => {
+    for (const site of ['reddit.com', 'instagram.com']) {
+      if (!isProcessing) break;
+      try {
+        log(`Searching ${site}...`, 'info');
+        const s = await bg({ action: 'google_images', query: `${productName} ${productData.brand || ''} site:${site}` });
+        (s.items || []).forEach((it) => webItems.push(it));
+      } catch (e) { /* optional */ }
+    }
+  })());
+
   await Promise.all(jobs);
 
   // Extra search vectors: ASIN + barcode (unique IDs pull the EXACT product).
@@ -1598,7 +1617,7 @@ function sleep(ms) {
 // ============================================================
 // DASHBOARD: tabs, settings, per-ASIN table, history, charts
 // ============================================================
-const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, market: 'in,com', strictMatch: false };
+const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, srcBing: true, srcSocial: false, market: 'in,com', strictMatch: false };
 let settings = Object.assign({}, SETTINGS_DEFAULTS);
 
 function loadSettings() {
@@ -1613,6 +1632,7 @@ function applySettingsToForm() {
   const set = (id, v) => { const el = document.getElementById(id); if (!el) return; if (el.type === 'checkbox') el.checked = !!v; else el.value = v; };
   set('setMin', settings.min); set('setMax', settings.max); set('setBatch', settings.batch);
   set('srcLens', settings.srcLens); set('srcGoogle', settings.srcGoogle); set('srcPinterest', settings.srcPinterest); set('srcAmazon', settings.srcAmazon);
+  set('srcBing', settings.srcBing); set('srcSocial', settings.srcSocial);
   set('setMarket', settings.market);
   set('strictMatch', settings.strictMatch);
 }
@@ -1622,6 +1642,7 @@ function saveSettings() {
   settings = {
     min: num('setMin', 25, 1, 500), max: num('setMax', 100, 1, 500), batch: num('setBatch', 10, 1, 20),
     srcLens: chk('srcLens'), srcGoogle: chk('srcGoogle'), srcPinterest: chk('srcPinterest'), srcAmazon: chk('srcAmazon'),
+    srcBing: chk('srcBing'), srcSocial: chk('srcSocial'),
     market: (document.getElementById('setMarket') || {}).value || 'in,com',
     strictMatch: chk('strictMatch')
   };

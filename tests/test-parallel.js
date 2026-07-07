@@ -24,6 +24,7 @@ function respond(msg) {
   if (a === 'lens_by_bytes' || a === 'lens_by_url') return { items: [{ full: 'https://f1', thumb: 't1', ctx: '', ugc: true }], text: 'lens' };
   if (a === 'google_images') return { items: googleItems || Array.from({ length: 20 }, (_, n) => ({ full: 'https://g' + n + msg.query, thumb: 't', ctx: '', ugc: false })) };
   if (a === 'amazon_review_images') return { images: ['https://media-amazon.com/images/I/a.jpg'], source: 'amazon.in' };
+  if (a === 'bing_images') return { items: [{ full: 'https://bing1', thumb: 't', ctx: '', ugc: true }] };
   return {};
 }
 const chromeStub = {
@@ -59,18 +60,26 @@ function ok(c, m) { if (c) pass++; else { fail++; fails.push('FAIL ' + m); } }
 (async () => {
   const item = { asin: 'B07RK4HST7', sku: 'Dropy-B07RK4HST7' };
 
-  // All 4 sources ON -> peak concurrency should be 4 (Lens+Google+Pinterest+Amazon)
+  // 4 core sources ON -> peak concurrency 4 (Lens+Google+Pinterest+Amazon)
   Pd.setProcessing(true);
-  Pd.setSettings({ srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true });
+  Pd.setSettings({ srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, srcBing: false, srcSocial: false });
   inFlight = 0; maxInFlight = 0; dispatched.length = 0;
   const data = await Pd.prepareProduct(item, 0);
   ok(data && Array.isArray(data.candidates), 'prepareProduct returns candidates');
-  eq(maxInFlight, 4, 'all 4 sources in-flight simultaneously (parallel)');
+  eq(maxInFlight, 4, 'all 4 core sources in-flight simultaneously (parallel)');
   ok(dispatched[0] === 'dropy_lookup', 'dropy_lookup runs first (sequential)');
+
+  // Adding Bing as a 5th source -> peak concurrency 5.
+  Pd.setProcessing(true);
+  Pd.setSettings({ srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, srcBing: true, srcSocial: false });
+  inFlight = 0; maxInFlight = 0; dispatched.length = 0;
+  await Pd.prepareProduct(item, 0);
+  eq(maxInFlight, 5, 'Bing adds a 5th parallel source');
+  ok(dispatched.includes('bing_images'), 'bing_images was dispatched');
 
   // Only 2 sources ON -> peak concurrency 2
   Pd.setProcessing(true);
-  Pd.setSettings({ srcLens: true, srcGoogle: false, srcPinterest: false, srcAmazon: true });
+  Pd.setSettings({ srcLens: true, srcGoogle: false, srcPinterest: false, srcAmazon: true, srcBing: false, srcSocial: false });
   inFlight = 0; maxInFlight = 0; dispatched.length = 0;
   await Pd.prepareProduct(item, 0);
   eq(maxInFlight, 2, 'only 2 enabled sources -> peak concurrency 2');
@@ -79,7 +88,7 @@ function ok(c, m) { if (c) pass++; else { fail++; fails.push('FAIL ' + m); } }
   ok(maxInFlight > 1, 'sources are NOT sequential');
 
   // ---- ASIN-match verification ----
-  Pd.setSettings({ srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, strictMatch: false });
+  Pd.setSettings({ srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, srcBing: false, srcSocial: false, strictMatch: false });
   Pd.setProcessing(true); includeAsin = true;
   const okData = await Pd.prepareProduct(item, 0);
   ok(okData.productData && okData.productData.asinVerified === true, 'ASIN present in dropy data -> verified');

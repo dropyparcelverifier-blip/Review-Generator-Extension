@@ -17,6 +17,8 @@
     "https://dropy.in/*",
     "https://www.google.com/*",
     "https://lens.google.com/*",
+    "https://www.bing.com/*",
+    "https://*.bing.com/*",
     "https://www.amazon.in/*",
     "https://www.amazon.com/*",
     "https://www.flipkart.com/*",

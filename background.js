@@ -549,6 +549,45 @@ async function scrapeLensImages() {
   return { items: out, ugc: out.filter((i) => i.ugc).length, text: (document.body ? document.body.innerText : '').slice(0, 2500) };
 }
 
+// --- injected: collect images from a Bing Images results page. Bing indexes
+// different sources than Google, so it surfaces extra real/UGC photos. Each
+// result anchor (a.iusc) carries an `m` JSON attribute with murl (full image),
+// turl (thumb) and purl (source page).
+async function scrapeBingImages() {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 8; i++) { window.scrollBy(0, window.innerHeight); await wait(400); }
+
+  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd\.it|redditmedia|pinimg|pinterest|twimg|twitter|x\.com|ytimg|youtube)/i;
+  const SHOPPING = /(media-amazon|ssl-images-amazon|images-amazon|images-na|rukminim|fkcdn|flixcart|nykaa|myntassets|myntra|assets\.ajio|ajio|jiomart|alicdn|aliexpress|ebayimg|scene7|cdn\.shopify|\/cdn\/shop\/)/i;
+  const MARKETING = /(?:^|[/_\-.])(banner|hero|promo|promotion|campaign|advert|advertis|lifestyle|cover|masthead|catalog|catalogue|packshot|render|mockup|template|infographic|swatch|logo|placeholder|sprite|favicon)(?:[/_\-.]|$)/i;
+
+  const items = [];
+  const seen = new Set();
+  const add = (full, thumb, ref) => {
+    let f = (full || thumb || '').trim();
+    if (!f || !/^https?:/i.test(f) || f.startsWith('data:')) return;
+    if (/\.svg(\?|$)/i.test(f)) return;
+    if (MARKETING.test(f) || SHOPPING.test(f) || SHOPPING.test(ref || '')) return;
+    if (seen.has(f)) return;
+    seen.add(f);
+    items.push({ full: f, thumb: (thumb || f).trim(), ctx: (ref || '').slice(0, 240), ugc: UGC.test(f) || UGC.test(ref || '') });
+  };
+
+  document.querySelectorAll('a.iusc').forEach((a) => {
+    try { const m = JSON.parse(a.getAttribute('m') || '{}'); add(m.murl, m.turl, m.purl); } catch (e) {}
+  });
+  // Fallback: plain result thumbnails if the JSON anchors weren't found.
+  if (items.length < 5) {
+    document.querySelectorAll('img.mimg, .imgpt img, .iusc img').forEach((img) => {
+      const t = img.currentSrc || img.getAttribute('src') || '';
+      add(img.getAttribute('data-src') || t, t, '');
+    });
+  }
+
+  items.sort((a, b) => (b.ugc ? 1 : 0) - (a.ugc ? 1 : 0));
+  return { items: items.slice(0, 40), ugc: items.filter((i) => i.ugc).length };
+}
+
 // --- injected: scrape CUSTOMER REVIEW images from an Amazon product page ---
 // (real photos uploaded by buyers — NOT the catalog/product image block).
 async function scrapeAmazonReviewImages() {
@@ -939,6 +978,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const url = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(msg.query)}`;
       const scraped = await runInTab(url, scrapeLensImages, { settle: 3500, timeout: 40000 });
       sendResponse(scraped || { images: [], ugc: 0 });
+    })();
+    return true;
+  }
+
+  if (msg.action === 'bing_images') {
+    (async () => {
+      if (!msg.query) { sendResponse({ items: [], ugc: 0 }); return; }
+      const url = `https://www.bing.com/images/search?q=${encodeURIComponent(msg.query)}`;
+      const scraped = await runInTab(url, scrapeBingImages, { settle: 3000, timeout: 40000 });
+      sendResponse(scraped || { items: [], ugc: 0 });
     })();
     return true;
   }
