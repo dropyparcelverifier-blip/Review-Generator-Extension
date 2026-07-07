@@ -494,7 +494,7 @@ async function scrapeLensImages() {
   await wait(700);
 
   // TRUE user-generated content: social / community / video platforms.
-  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd\.it|redditmedia|pinimg|pinterest|twimg|twitter|x\.com|ytimg|youtube)/i;
+  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd.it|redditmedia|pinimg|pinterest|twimg|twitter|x.com|ytimg|youtube|blogspot|blogger|wordpress|wp.com|medium.com|tumblr|flickr|staticflickr|imgur|quora)/i;
   // Shopping / catalog CDNs = listing & white-background model shots — DROP these.
   const SHOPPING = /(media-amazon|ssl-images-amazon|images-amazon|images-na|rukminim|fkcdn|flixcart|nykaa|myntassets|myntra|assets\.ajio|ajio|jiomart|alicdn|aliexpress|ae0?1\.alicdn|ebayimg|scene7|cdn\.shopify|\/cdn\/shop\/)/i;
   const isThumb = (u) => /gstatic\.com|googleusercontent\.com|encrypted-tbn|\/images\?q=tbn|tbn:/i.test(u);
@@ -575,7 +575,7 @@ async function scrapeBingImages() {
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   for (let i = 0; i < 8; i++) { window.scrollBy(0, window.innerHeight); await wait(400); }
 
-  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd\.it|redditmedia|pinimg|pinterest|twimg|twitter|x\.com|ytimg|youtube)/i;
+  const UGC = /(instagram|cdninstagram|fbcdn|facebook|tiktok|tiktokcdn|reddit|redd.it|redditmedia|pinimg|pinterest|twimg|twitter|x.com|ytimg|youtube|blogspot|blogger|wordpress|wp.com|medium.com|tumblr|flickr|staticflickr|imgur|quora)/i;
   const SHOPPING = /(media-amazon|ssl-images-amazon|images-amazon|images-na|rukminim|fkcdn|flixcart|nykaa|myntassets|myntra|assets\.ajio|ajio|jiomart|alicdn|aliexpress|ebayimg|scene7|cdn\.shopify|\/cdn\/shop\/)/i;
   const MARKETING = /(?:^|[/_\-.])(banner|hero|promo|promotion|campaign|advert|advertis|lifestyle|cover|masthead|catalog|catalogue|packshot|render|mockup|template|infographic|swatch|logo|placeholder|sprite|favicon)(?:[/_\-.]|$)/i;
 
@@ -621,8 +621,15 @@ async function scrapeAmazonReviewImages() {
   // Jump to the reviews area and scroll so customer images lazy-load.
   const rev = document.querySelector('#reviewsMedley, #customerReviews, #cm-cr-dp-review-list, [data-hook="reviews-medley-footer"]');
   if (rev && rev.scrollIntoView) rev.scrollIntoView();
-  for (let i = 0; i < 8; i++) { window.scrollBy(0, window.innerHeight); await wait(700); }
-  await wait(900);
+  for (let i = 0; i < 8; i++) { window.scrollBy(0, window.innerHeight); await wait(600); }
+  // Open the "See all customer photos/images" gallery for MANY more buyer photos.
+  Array.from(document.querySelectorAll('a, span, button, [role="button"]')).forEach((el) => {
+    const t = (el.textContent || '').trim().toLowerCase();
+    if (/^see all (customer )?(photos|images)|see more (photos|images)|view all (photos|images)|all photos/.test(t)) { try { el.click(); } catch (e) {} }
+  });
+  await wait(1300);
+  for (let i = 0; i < 6; i++) { window.scrollBy(0, window.innerHeight); await wait(500); }
+  await wait(700);
 
   const out = [];
   const seen = new Set();
@@ -636,10 +643,11 @@ async function scrapeAmazonReviewImages() {
     out.push(u);
   };
 
-  // Customer-images strip + per-review image tiles (review sections only).
+  // Customer-images strip + per-review image tiles + the opened photo gallery.
   const SEL = '#cr-media-carousel img, [data-hook="cr-media-carousel"] img, ' +
     '[data-hook="review-image-tile"], img[data-hook="review-image-tile"], ' +
     '.review-image-tile, #cm_cr_carousel_images_section img, .cr-lightbox-image-thumbnail img, ' +
+    '.a-popover img[src*="media-amazon.com/images/I"], [data-hook="review-image-tile-section"] img, ' +
     '#reviewsMedley img[src*="media-amazon.com/images/I"], #cm-cr-dp-review-list img[src*="media-amazon.com/images/I"]';
   document.querySelectorAll(SEL).forEach((el) => {
     const u = (el.tagName === 'IMG')
@@ -648,7 +656,7 @@ async function scrapeAmazonReviewImages() {
     add(u);
   });
 
-  return { images: out.slice(0, 30) };
+  return { images: out.slice(0, 40) };
 }
 
 // --- injected: scrape Google Search AI Overview text (best-effort) ---
@@ -978,14 +986,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'amazon_review_images') {
     (async () => {
       const domains = (msg.domains && msg.domains.length) ? msg.domains : ['www.amazon.in', 'www.amazon.com'];
+      // Collect buyer photos from ALL marketplaces and merge — a US product (e.g.
+      // One A Day) often has few/no review photos on .in but many on .com.
+      const all = [];
+      const seen = new Set();
+      let source = '';
       for (const d of domains) {
         const res = await runInTab(`https://${d}/dp/${msg.asin}`, scrapeAmazonReviewImages, { settle: 2500, timeout: 35000 });
-        if (res && !res.captcha && res.images && res.images.length) {
-          sendResponse({ images: res.images, source: d });
-          return;
+        if (res && !res.captcha && res.images) {
+          res.images.forEach((u) => { if (u && !seen.has(u)) { seen.add(u); all.push(u); } });
+          if (res.images.length && !source) source = d;
         }
+        if (all.length >= 30) break;
       }
-      sendResponse({ images: [] });
+      sendResponse({ images: all.slice(0, 30), source });
     })();
     return true;
   }

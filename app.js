@@ -428,6 +428,22 @@ function pickImages(items) {
     });
     pickItems = items;
     imagePicker.classList.remove('hidden');
+
+    // Default to REAL user photos only when any exist — so you see genuine
+    // review-type shots first, not the catalog images. If none are flagged real,
+    // show everything (don't hand back an empty grid).
+    const ugcCount = items.filter((it) => it.ugc).length;
+    const ugcBox = document.getElementById('ugcOnly');
+    if (ugcBox) {
+      ugcBox.checked = ugcCount > 0;
+      imageGrid.classList.toggle('ugc-only', ugcCount > 0);
+    }
+    const hint = document.getElementById('pickerHint');
+    if (hint) {
+      hint.textContent = ugcCount > 0
+        ? `Showing ${ugcCount} real user photo(s) first (uncheck below to see all ${items.length}). Tap to ✓ keep, ✕ to remove, ⤢ to enlarge.`
+        : `No genuine customer photos found — showing product/catalog images (${items.length}). Tap to ✓ keep, ✕ to remove, ⤢ to enlarge.`;
+    }
     updateProductStatus('Select review images, then click Continue', null);
     pickResolve = (val) => {
       imagePicker.classList.add('hidden');
