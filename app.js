@@ -618,6 +618,13 @@ async function startProcessing() {
     const fname = uploadedFileBase ? `${uploadedFileBase}.csv` : `reviews_${dateStr}_${Date.now()}.csv`;
     csvBatch = { fileName: fname, rows: [], asins: products.map((p) => p.asin) };
   }
+  // Always name the output after the CURRENT uploaded file (e.g. cerave.txt ->
+  // cerave.csv), even when resuming an existing batch. If the name changes, the
+  // file must be (re)written under the new name.
+  if (uploadedFileBase && csvBatch.fileName !== `${uploadedFileBase}.csv`) {
+    csvBatch.fileName = `${uploadedFileBase}.csv`;
+    csvBatch.written = false;
+  }
   // Persisted image selections (by ASIN), so a Stop/close during selection or
   // generation doesn't force you to re-pick — resume jumps straight to generating.
   if (!csvBatch.pending || typeof csvBatch.pending !== 'object') csvBatch.pending = {};

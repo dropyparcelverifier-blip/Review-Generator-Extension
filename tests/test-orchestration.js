@@ -13,6 +13,7 @@ globalThis.__t = {
   startProcessing,
   setProducts: (v) => { products = v; },
   setSettings: (v) => { settings = Object.assign({}, settings, v); },
+  setFileBase: (v) => { uploadedFileBase = v; },
   resetState: () => { csvBatch = null; geminiTabId = null; isProcessing = false; isPaused = false; loadProgress(); },
   csvBatch: () => csvBatch,
   isProcessing: () => isProcessing,
@@ -191,6 +192,17 @@ async function run() {
   s = T.snap();
   eq(s.prepareCalls, [], 'S10 rerun processes nothing (all done)');
   eq(saved.length, 0, 'S10 rerun of all-done batch does NOT re-download the file');
+
+  // S11 output CSV is named after the uploaded file (cerave.txt -> cerave.csv)
+  resetStore(); T.setFileBase('cerave'); T.setProducts(P('A')); T.install({});
+  await T.startProcessing();
+  eq(T.snap().fileName, 'cerave.csv', 'S11 fresh batch named after uploaded file');
+  ok(saved.length && saved[saved.length - 1].filename === 'cerave.csv', 'S11 downloaded as cerave.csv');
+  // resume the same batch but with a different upload name -> follows the new name
+  T.resetState(); T.setFileBase('newname'); T.setProducts(P('A', 'B')); T.install({});
+  await T.startProcessing();
+  eq(T.snap().fileName, 'newname.csv', 'S11 resume follows the current uploaded file name');
+  T.setFileBase(''); // reset for any later scenarios
 
   // report
   console.log('\n============ ORCHESTRATION RESULTS ============');
