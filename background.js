@@ -118,14 +118,12 @@ async function deleteShopifyFiles(fileIds) {
   return { ok: true, deleted };
 }
 
-// POOL of reusable background tabs for scraping. A single shared tab would force
-// every source (Lens, Google, Pinterest, Amazon) to run one-at-a-time; the pool
-// lets concurrent runInTab() calls each grab their OWN tab so sources run in
-// PARALLEL. Tabs are reused across calls and all closed at the end of a run. The
-// id set is mirrored to session storage so a service-worker restart can still
-// find and close them (no orphaned tabs).
-const scrapeTabs = new Set(); // every scrape tab we created
-const freeTabs = [];          // subset currently idle & reusable
+// Scrape tabs are created PER scrape and CLOSED as soon as that scrape finishes,
+// so tabs never accumulate. Concurrent runInTab() calls each open their own tab,
+// which is what keeps the sources (Lens/Google/Pinterest/Amazon) running in
+// PARALLEL. The open-tab id set is mirrored to session storage so a
+// service-worker restart can still find and close any it left behind.
+const scrapeTabs = new Set();
 
 function tabExists(id) {
   return new Promise((resolve) => {
@@ -134,57 +132,50 @@ function tabExists(id) {
   });
 }
 
-async function loadScrapeTabs() {
-  if (scrapeTabs.size) return;
-  try { const r = await chrome.storage.session.get('scrapeTabs'); ((r && r.scrapeTabs) || []).forEach((id) => scrapeTabs.add(id)); } catch (e) {}
-}
-async function persistScrapeTabs() {
-  try { await chrome.storage.session.set({ scrapeTabs: Array.from(scrapeTabs) }); } catch (e) {}
+function persistScrapeTabs() {
+  try { chrome.storage.session.set({ scrapeTabs: Array.from(scrapeTabs) }); } catch (e) {}
 }
 
-// Grab an idle tab (reuse a live one, else create). Marks it busy until released.
-async function acquireTab() {
-  await loadScrapeTabs();
-  while (freeTabs.length) {
-    const id = freeTabs.pop();
-    if (await tabExists(id)) return id;
-    scrapeTabs.delete(id); // stale (closed) — drop it
-  }
+// Open a fresh background tab for one scrape.
+async function openScrapeTab() {
   const id = await new Promise((resolve) => {
     chrome.tabs.create({ url: 'about:blank', active: false }, (tab) => resolve(tab.id));
   });
   scrapeTabs.add(id);
-  await persistScrapeTabs();
+  persistScrapeTabs();
   return id;
 }
 
-function releaseTab(id) {
-  if (id != null && scrapeTabs.has(id) && !freeTabs.includes(id)) freeTabs.push(id);
+// Close a scrape tab the moment its work is done.
+function closeScrapeTab(id) {
+  if (id == null) return;
+  try { chrome.tabs.remove(id); } catch (e) {}
+  if (scrapeTabs.delete(id)) persistScrapeTabs();
 }
 
+// Close every scrape tab — end of run, plus any left open by a prior SW instance.
 async function closeAllScrapeTabs() {
-  await loadScrapeTabs();
+  try { const r = await chrome.storage.session.get('scrapeTabs'); ((r && r.scrapeTabs) || []).forEach((id) => scrapeTabs.add(id)); } catch (e) {}
   for (const id of scrapeTabs) { try { chrome.tabs.remove(id); } catch (e) {} }
   scrapeTabs.clear();
-  freeTabs.length = 0;
   try { await chrome.storage.session.remove('scrapeTabs'); } catch (e) {}
 }
 
-// Navigates a pooled tab to `url`, waits for load (+settle), runs `injectFn` in
-// the page, returns its result, and releases the tab. Resolves null on timeout.
-// Concurrent calls use different pooled tabs, enabling parallel scraping.
+// Opens a fresh tab, navigates to `url`, waits for load (+settle), runs `injectFn`
+// in the page, returns its result, and CLOSES the tab. Resolves null on timeout.
+// Concurrent calls open separate tabs, enabling parallel scraping.
 function runInTab(url, injectFn, opts) {
   const settle = (opts && opts.settle) || 1800;
   const timeout = (opts && opts.timeout) || 30000;
   return new Promise(async (resolve) => {
-    const tabId = await acquireTab();
+    const tabId = await openScrapeTab();
     let done = false;
     const finish = (result) => {
       if (done) return;
       done = true;
       chrome.tabs.onUpdated.removeListener(listener);
       clearTimeout(guard);
-      releaseTab(tabId); // return to the pool for reuse
+      closeScrapeTab(tabId); // close as soon as the work is done — no accumulation
       resolve(result);
     };
     function listener(tid, info) {

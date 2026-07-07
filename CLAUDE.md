@@ -56,8 +56,11 @@ customer photos and exporting an import-ready CSV.
 `conflictAction`), `delete_shopify_files`, `close_scrape_tab`.
 
 ## Notable behaviors
-- **Scrape-tab pool** (`acquireTab`/`releaseTab`/`closeAllScrapeTabs`): reusable
-  background tabs enabling parallel scrapes; closed at run end.
+- **Scrape tabs** (`openScrapeTab`/`closeScrapeTab`/`closeAllScrapeTabs`): each
+  `runInTab` opens its own background tab and **closes it the moment the scrape
+  finishes**, so tabs never accumulate; concurrent calls are what make sources run
+  in parallel. Open-tab ids are mirrored to `chrome.storage.session` so a SW
+  restart can still close any leftovers (`close_scrape_tab` at run end).
 - **Wrong-product guard:** `prepareProduct` verifies the ASIN appears in the dropy
   product's handle/SKU/description. `settings.strictMatch` → skip unverified; else warn
   and flag it in the picker/row.
