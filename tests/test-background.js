@@ -124,6 +124,22 @@ function install({ dom = [], products = [], suggestOk = true, js = {}, html = {}
   eq(res && res.url, '/products/right', 'HTML pass: finds ASIN in product HTML when absent from .js');
   ok(res && res.matched === true && res.via === 'html', 'HTML pass: matched via html');
 
+  // Predictive #1 is TRUSTED even when the ASIN isn't in any product JSON/HTML
+  // (Shopify search matched it via a metafield). Full-text ranks screws first,
+  // predictive ranks centrum #1 -> must pick centrum, matched via predictive.
+  install({
+    products: [{ handle: 'centrum-200', url: '/products/centrum-200' }], // predictive #1
+    dom: ['tjfujie-screws', 'centrum-200'], // full-text ranks screws first
+    js: {
+      'centrum-200': { handle: 'centrum-200', title: 'Centrum', variants: [{ sku: 'INTERNAL', barcode: '' }] }, // no ASIN
+      'tjfujie-screws': { handle: 'tjfujie-screws', title: 'Screws', variants: [{ sku: 'TJ', barcode: '' }] },
+    },
+    html: { 'centrum-200': '<html>centrum</html>', 'tjfujie-screws': '<html>screws</html>' }, // no ASIN
+  });
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  eq(res && res.url, '/products/centrum-200', 'predictive #1 preferred over full-text top when ASIN not in product data');
+  ok(res && res.matched === true && res.via === 'predictive', 'predictive fallback flagged matched');
+
   // No match anywhere -> top search result, flagged unmatched.
   install({
     dom: ['a', 'b'], products: [],

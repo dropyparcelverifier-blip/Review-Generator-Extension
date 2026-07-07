@@ -209,26 +209,27 @@ async function findDropyProductByAsin(asin) {
   };
   const cands = [];
   const seen = new Set();
-  const addUrl = (u) => {
+  const addUrl = (u, predictive) => {
     if (!u) return;
     const m = String(u).split('?')[0].match(/\/products\/([^/?#]+)/);
     if (!m) return;
     const handle = m[1];
-    if (handle && !seen.has(handle)) { seen.add(handle); cands.push({ handle, url: '/products/' + handle }); }
+    if (handle && !seen.has(handle)) { seen.add(handle); cands.push({ handle, url: '/products/' + handle, predictive: !!predictive }); }
   };
   try {
-    // 1) Product links on the loaded /search results page (full-text search —
-    //    finds products even when predictive search misses them). These come first
-    //    so the top result is the fallback if the ASIN can't be auto-confirmed.
-    try { document.querySelectorAll('a[href*="/products/"]').forEach((a) => addUrl(a.getAttribute('href') || '')); } catch (e) {}
-    // 2) Predictive search (often ranks the exact product high).
+    // 1) PREDICTIVE search FIRST — this is exactly what dropy's search box shows,
+    //    and what clicking the top result gives. It ranks the exact-ASIN product
+    //    highest, so it's both the priority and the fallback.
     try {
       const r = await fetch('/search/suggest.json?q=' + encodeURIComponent(asin) + '&resources[type]=product&resources[limit]=10', { headers: { Accept: 'application/json' } });
       if (r.ok) {
         const j = await r.json();
-        ((j && j.resources && j.resources.results && j.resources.results.products) || []).forEach((p) => p && addUrl(p.url || (p.handle && '/products/' + p.handle)));
+        ((j && j.resources && j.resources.results && j.resources.results.products) || []).forEach((p) => p && addUrl(p.url || (p.handle && '/products/' + p.handle), true));
       }
     } catch (e) {}
+    // 2) Then the full-text /search results-page DOM — catches products the
+    //    predictive box misses (its index is narrower).
+    try { document.querySelectorAll('a[href*="/products/"]').forEach((a) => addUrl(a.getAttribute('href') || '', false)); } catch (e) {}
 
     if (!cands.length) return challenged() ? { blocked: true } : { none: true };
     const top = cands.slice(0, 10);
@@ -253,9 +254,12 @@ async function findDropyProductByAsin(asin) {
         if (has(await hr.text())) return { url: p.url, matched: true, via: 'html' };
       } catch (e) { /* try next candidate */ }
     }
-    // Couldn't confirm the ASIN — fall back to the top search result, flagged so
-    // the UI shows ⚠ (still the right product in the common single-result case).
-    return { url: cands[0].url, matched: false };
+    // No literal ASIN in the product data — trust the TOP result the search
+    // returned. Predictive #1 (or a sole result) is what the store's search
+    // matched to the ASIN, so treat it as a match; only an ambiguous multi-result
+    // full-text top is flagged unverified.
+    const best = cands[0];
+    return { url: best.url, matched: !!best.predictive || cands.length === 1, via: best.predictive ? 'predictive' : 'search' };
   } catch (e) {
     return challenged() ? { blocked: true } : { error: e.message };
   }
