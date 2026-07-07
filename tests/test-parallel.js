@@ -17,11 +17,12 @@ globalThis.__p = {
 let inFlight = 0, maxInFlight = 0;
 const dispatched = [];
 let includeAsin = true; // whether the dropy product data contains the ASIN
+let googleItems = null;  // when set, google_images returns these exact items
 function respond(msg) {
   const a = msg.action;
   if (a === 'dropy_lookup') return { name: 'Test Product', brand: 'BrandX', originalImages: ['https://cdn.shopify.com/x.jpg'], imageData: 'data:image/jpeg;base64,AAAA', barcode: '', productUrl: includeAsin ? 'https://dropy.in/products/bbr-B07RK4HST7-fork' : 'https://dropy.in/products/some-random-item' };
   if (a === 'lens_by_bytes' || a === 'lens_by_url') return { items: [{ full: 'https://f1', thumb: 't1', ctx: '', ugc: true }], text: 'lens' };
-  if (a === 'google_images') return { items: Array.from({ length: 20 }, (_, n) => ({ full: 'https://g' + n + msg.query, thumb: 't', ctx: '', ugc: false })) };
+  if (a === 'google_images') return { items: googleItems || Array.from({ length: 20 }, (_, n) => ({ full: 'https://g' + n + msg.query, thumb: 't', ctx: '', ugc: false })) };
   if (a === 'amazon_review_images') return { images: ['https://media-amazon.com/images/I/a.jpg'], source: 'amazon.in' };
   return {};
 }
@@ -92,6 +93,24 @@ function ok(c, m) { if (c) pass++; else { fail++; fails.push('FAIL ' + m); } }
   Pd.setProcessing(true); includeAsin = false;
   const skipData = await Pd.prepareProduct(item, 0);
   ok(skipData && skipData.skip === true, 'strictMatch ON -> unverified product is skipped');
+
+  // ---- image relevance: whole-word context match keeps right, drops wrong ----
+  // product brand 'BrandX' -> token 'brandx'. An image whose context names the
+  // brand as a WHOLE WORD is kept; one whose context names a different product
+  // (no token as a whole word) is dropped — even if a token appears as a substring.
+  Pd.setSettings({ strictMatch: false, srcLens: false, srcPinterest: false, srcAmazon: false, srcGoogle: true });
+  Pd.setProcessing(true); includeAsin = true;
+  googleItems = [
+    { full: 'https://match', thumb: 't', ctx: 'brandx official review', ugc: false },
+    { full: 'https://wrong', thumb: 't', ctx: 'cerave lotion moisturizer', ugc: false },
+    { full: 'https://substr', thumb: 't', ctx: 'embeddedbrandxinside hash', ugc: false }, // substring, not whole word
+  ];
+  const relData = await Pd.prepareProduct(item, 0);
+  const urls = (relData.candidates || []).map((c) => c.url);
+  ok(urls.includes('https://match'), 'context-matched image kept');
+  ok(!urls.includes('https://wrong'), 'wrong-product image (mismatched context) dropped');
+  ok(!urls.includes('https://substr'), 'substring-only token match dropped (whole-word required)');
+  googleItems = null;
 
   console.log('\n============ PARALLEL RESULTS ============');
   if (fails.length) console.log(fails.join('\n') + '\n');
