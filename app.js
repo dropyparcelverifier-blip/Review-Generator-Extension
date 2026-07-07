@@ -337,8 +337,18 @@ function pickImages(items) {
       const display = item.dataUrl || item.thumb || item.url; // thumb loads reliably
       if (!display) return;
       const cell = document.createElement('div');
-      cell.className = 'image-cell';
+      cell.className = 'image-cell' + (item.ugc ? ' ugc' : '');
       cell.dataset.idx = idx;
+
+      // Badge genuine user-taken photos (social / customer-review sources) so the
+      // real-vibe ones stand out from catalog shots.
+      if (item.ugc) {
+        const tag = document.createElement('span');
+        tag.className = 'ugc-tag';
+        tag.textContent = '👤 real';
+        tag.title = 'Genuine user photo (social / customer review)';
+        cell.appendChild(tag);
+      }
 
       const img = document.createElement('img');
       img.src = display;
@@ -436,6 +446,12 @@ function collectSelectedImages() {
 
 useImagesBtn.addEventListener('click', () => { if (pickResolve) pickResolve(collectSelectedImages()); });
 skipImagesBtn.addEventListener('click', () => { if (pickResolve) pickResolve([]); });
+
+// "Real user photos only" — hides non-UGC (catalog/search) cells in the picker.
+const ugcOnly = document.getElementById('ugcOnly');
+if (ugcOnly) ugcOnly.addEventListener('change', () => {
+  imageGrid.classList.toggle('ugc-only', ugcOnly.checked);
+});
 
 const ASIN_RE = /\b(B0[A-Z0-9]{8}|\d{9}[\dX])\b/i; // ASIN: B0XXXXXXXX or 10-digit ISBN-style
 
@@ -956,14 +972,19 @@ async function prepareProduct(item, productIndex) {
   if (dropped) log(`Filtered out ${dropped} other-product image(s)`, 'info');
   if (unknown.length > unknownCap) log(`Hid ${unknown.length - unknownCap} unverified image(s) (use ✕ to remove any wrong ones)`, 'info');
 
-  // Candidates: thumb for display, full for upload. Catalog images only if empty.
-  const candidates = kept.map((it) => ({ url: it.full, thumb: it.thumb, dataUrl: '', alt: '' }));
+  // Candidates: thumb for display, full for upload. `ugc` marks genuine
+  // user-taken photos (Amazon reviews, Instagram/Reddit/TikTok, etc.) vs catalog
+  // shots — the picker uses it to badge/sort/filter for a "real customer" vibe.
+  // Real user photos first.
+  kept.sort((a, b) => (b.ugc ? 1 : 0) - (a.ugc ? 1 : 0));
+  const candidates = kept.map((it) => ({ url: it.full, thumb: it.thumb, dataUrl: '', alt: '', ugc: !!it.ugc }));
   if (!candidates.length) {
     log('No real photos found — falling back to product images', 'warn');
-    originals.forEach((u) => candidates.push({ url: u, thumb: u, dataUrl: '', alt: '' }));
-    (productData.gallery || []).forEach((g) => candidates.push({ url: g.url, thumb: g.data || g.url, dataUrl: g.data, alt: g.alt }));
+    originals.forEach((u) => candidates.push({ url: u, thumb: u, dataUrl: '', alt: '', ugc: false }));
+    (productData.gallery || []).forEach((g) => candidates.push({ url: g.url, thumb: g.data || g.url, dataUrl: g.data, alt: g.alt, ugc: false }));
   }
-  log(`Candidates ready: ${kept.length} photo(s) (${matched.length} confirmed this product)`, 'info');
+  const ugcCount = candidates.filter((c) => c.ugc).length;
+  log(`Candidates ready: ${kept.length} photo(s) — ${ugcCount} real user photo(s) (${matched.length} confirmed this product)`, 'info');
 
   // Reference image shown large in the picker while choosing.
   const g0 = (productData.gallery && productData.gallery[0]) || {};
@@ -1617,7 +1638,7 @@ function sleep(ms) {
 // ============================================================
 // DASHBOARD: tabs, settings, per-ASIN table, history, charts
 // ============================================================
-const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, srcBing: true, srcSocial: false, market: 'in,com', strictMatch: false };
+const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, srcBing: true, srcSocial: true, market: 'in,com', strictMatch: false };
 let settings = Object.assign({}, SETTINGS_DEFAULTS);
 
 function loadSettings() {
