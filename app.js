@@ -429,19 +429,22 @@ function pickImages(items) {
     pickItems = items;
     imagePicker.classList.remove('hidden');
 
-    // Show ALL candidates by default (real ones sorted first + 👤 badged). We do
-    // NOT auto-hide to "real only": detecting real photos from Google's new image
-    // UI is unreliable, so hiding would drop many genuine photos. Use the toggle
-    // to filter when the flags look right.
+    // Start from the REAL set only when there are enough genuine photos to be
+    // useful (>= 6). Otherwise show all (real sorted first + badged) so we never
+    // strand you with too few. Either way the toggle lets you switch.
+    const REAL_DEFAULT_MIN = 6;
     const ugcCount = items.filter((it) => it.ugc).length;
+    const startReal = ugcCount >= REAL_DEFAULT_MIN;
     const ugcBox = document.getElementById('ugcOnly');
     if (ugcBox) {
-      ugcBox.checked = false;
-      imageGrid.classList.remove('ugc-only');
+      ugcBox.checked = startReal;
+      imageGrid.classList.toggle('ugc-only', startReal);
     }
     const hint = document.getElementById('pickerHint');
     if (hint) {
-      hint.textContent = `${items.length} candidate(s)${ugcCount ? ` · ${ugcCount} flagged 👤 real (shown first)` : ''}. Tap to ✓ keep, ✕ to remove, ⤢ to enlarge. Tick "real photos only" to filter.`;
+      hint.textContent = startReal
+        ? `Showing ${ugcCount} real user photo(s) — uncheck below to see all ${items.length}. ✕ removes wrong variants/combos, ⤢ enlarges.`
+        : `${items.length} candidate(s)${ugcCount ? ` · ${ugcCount} flagged 👤 real (shown first)` : ''}. Tap ✓ keep, ✕ remove, ⤢ enlarge. Tick "real photos only" to filter.`;
     }
     updateProductStatus('Select review images, then click Continue', null);
     pickResolve = (val) => {
