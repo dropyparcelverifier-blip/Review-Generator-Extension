@@ -347,10 +347,24 @@ function pickImages(items) {
       img.onload = () => {
         const w = img.naturalWidth || 0, h = img.naturalHeight || 0;
         const r = h ? w / h : 1;
-        // Drop banner/ad shapes (the preview keeps the real aspect ratio). We
-        // display a thumbnail but UPLOAD the full-res source, so don't size-filter.
+        // Drop banner/ad shapes (the preview keeps the real aspect ratio).
         if (w && h && (r > 2.4 || r < 0.4)) cell.remove();
       };
+
+      // The picker shows the thumbnail, but we UPLOAD `item.url` — probe ITS real
+      // resolution and drop sources too small to be a decent review photo (Google
+      // Lens returns tiny ~200px cached thumbnails). Captured (dataUrl) candidates
+      // are already full-res, so skip them. On a probe error we keep the cell (we
+      // couldn't measure — don't drop what might still upload fine).
+      const MIN_UPLOAD_PX = 350;
+      if (item.url && !item.dataUrl) {
+        const probe = new Image();
+        probe.onload = () => {
+          const pw = probe.naturalWidth || 0, ph = probe.naturalHeight || 0;
+          if (pw && ph && Math.min(pw, ph) < MIN_UPLOAD_PX) cell.remove();
+        };
+        probe.src = item.url;
+      }
 
       const check = document.createElement('span');
       check.className = 'check';
