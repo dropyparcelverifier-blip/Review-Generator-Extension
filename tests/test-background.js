@@ -140,6 +140,28 @@ function install({ dom = [], products = [], suggestOk = true, js = {}, html = {}
   eq(res && res.url, '/products/centrum-200', 'predictive #1 preferred over full-text top when ASIN not in product data');
   ok(res && res.matched === true && res.via === 'predictive', 'predictive fallback flagged matched');
 
+  // "0 results" page (Enter) but predictive box HAS the product: the recommended
+  // /products/ links on the empty page must be ignored; predictive wins.
+  install({
+    title: 'Search: 0 results found', bodyText: 'No results found for "B09BVYY7XR".',
+    products: [{ handle: 'centrum-200', url: '/products/centrum-200' }],
+    dom: ['recommended-thing'],
+    js: { 'centrum-200': { handle: 'centrum-200', title: 'Centrum', variants: [{ sku: 'INTERNAL', barcode: '' }] }, 'recommended-thing': { handle: 'recommended-thing', variants: [{ sku: 'Z', barcode: '' }] } },
+    html: { 'centrum-200': '<html>c</html>', 'recommended-thing': '<html>r</html>' },
+  });
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  eq(res && res.url, '/products/centrum-200', '0-results page: predictive wins, recommendation ignored');
+
+  // "0 results" page AND predictive empty -> none (never pick a recommendation).
+  install({
+    title: 'Search: 0 results found', bodyText: 'No results found.',
+    products: [], dom: ['recommended-thing'],
+    js: { 'recommended-thing': { handle: 'recommended-thing', variants: [{ sku: 'Z', barcode: '' }] } },
+    html: { 'recommended-thing': '<html>r</html>' },
+  });
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  ok(res && res.none === true, '0-results page + empty predictive -> none (no recommendation picked)');
+
   // No match anywhere -> top search result, flagged unmatched.
   install({
     dom: ['a', 'b'], products: [],

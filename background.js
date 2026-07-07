@@ -228,8 +228,14 @@ async function findDropyProductByAsin(asin) {
       }
     } catch (e) {}
     // 2) Then the full-text /search results-page DOM — catches products the
-    //    predictive box misses (its index is narrower).
-    try { document.querySelectorAll('a[href*="/products/"]').forEach((a) => addUrl(a.getAttribute('href') || '', false)); } catch (e) {}
+    //    predictive box misses. But SKIP it on a "0 results" page: pressing Enter
+    //    can yield 0 results even when the predictive box has the product, and any
+    //    /products/ links there are just recommendations, not real matches.
+    const pageTxt = ((document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 600) : '')).toLowerCase();
+    const noResults = /(?:^|\D)0 results|no results found|no results|no products|couldn'?t find|did not match/i.test(pageTxt);
+    if (!noResults) {
+      try { document.querySelectorAll('a[href*="/products/"]').forEach((a) => addUrl(a.getAttribute('href') || '', false)); } catch (e) {}
+    }
 
     if (!cands.length) return challenged() ? { blocked: true } : { none: true };
     const top = cands.slice(0, 10);
