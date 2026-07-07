@@ -429,34 +429,20 @@ function pickImages(items) {
     pickItems = items;
     imagePicker.classList.remove('hidden');
 
-    // Default to REAL user photos only when any exist — so you see genuine
-    // review-type shots first, not the catalog images. If none are flagged real,
-    // show everything (don't hand back an empty grid).
+    // Show ALL candidates by default (real ones sorted first + 👤 badged). We do
+    // NOT auto-hide to "real only": detecting real photos from Google's new image
+    // UI is unreliable, so hiding would drop many genuine photos. Use the toggle
+    // to filter when the flags look right.
     const ugcCount = items.filter((it) => it.ugc).length;
     const ugcBox = document.getElementById('ugcOnly');
     if (ugcBox) {
-      ugcBox.checked = ugcCount > 0;
-      imageGrid.classList.toggle('ugc-only', ugcCount > 0);
+      ugcBox.checked = false;
+      imageGrid.classList.remove('ugc-only');
     }
     const hint = document.getElementById('pickerHint');
     if (hint) {
-      hint.textContent = ugcCount > 0
-        ? `Showing ${ugcCount} real user photo(s) first (uncheck below to see all ${items.length}). Tap to ✓ keep, ✕ to remove, ⤢ to enlarge.`
-        : `No genuine customer photos found — showing product/catalog images (${items.length}). Tap to ✓ keep, ✕ to remove, ⤢ to enlarge.`;
+      hint.textContent = `${items.length} candidate(s)${ugcCount ? ` · ${ugcCount} flagged 👤 real (shown first)` : ''}. Tap to ✓ keep, ✕ to remove, ⤢ to enlarge. Tick "real photos only" to filter.`;
     }
-    // Safety net: the async filters (low-res probe, broken images) can remove
-    // cells after render. If "real photos only" ends up empty, auto-show all so
-    // the grid is never blank while candidates exist.
-    setTimeout(() => {
-      if (imagePicker.classList.contains('hidden')) return;
-      const total = imageGrid.querySelectorAll('.image-cell').length;
-      const realLeft = imageGrid.querySelectorAll('.image-cell.ugc').length;
-      if (ugcBox && ugcBox.checked && realLeft === 0 && total > 0) {
-        ugcBox.checked = false;
-        imageGrid.classList.remove('ugc-only');
-        if (hint) hint.textContent = `No real photos remained — showing all ${total} candidate(s). Tap to ✓ keep, ✕ to remove, ⤢ to enlarge.`;
-      }
-    }, 2600);
     updateProductStatus('Select review images, then click Continue', null);
     pickResolve = (val) => {
       imagePicker.classList.add('hidden');
