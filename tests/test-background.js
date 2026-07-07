@@ -124,9 +124,9 @@ function install({ dom = [], products = [], suggestOk = true, js = {}, html = {}
   eq(res && res.url, '/products/right', 'HTML pass: finds ASIN in product HTML when absent from .js');
   ok(res && res.matched === true && res.via === 'html', 'HTML pass: matched via html');
 
-  // Predictive #1 is TRUSTED even when the ASIN isn't in any product JSON/HTML
-  // (Shopify search matched it via a metafield). Full-text ranks screws first,
-  // predictive ranks centrum #1 -> must pick centrum, matched via predictive.
+  // Predictive result is PREFERRED in ordering (over the full-text top), but when
+  // there are multiple candidates and the ASIN isn't in any product data, it must
+  // be flagged UNVERIFIED (not silently trusted).
   install({
     products: [{ handle: 'centrum-200', url: '/products/centrum-200' }], // predictive #1
     dom: ['tjfujie-screws', 'centrum-200'], // full-text ranks screws first
@@ -137,8 +137,30 @@ function install({ dom = [], products = [], suggestOk = true, js = {}, html = {}
     html: { 'centrum-200': '<html>centrum</html>', 'tjfujie-screws': '<html>screws</html>' }, // no ASIN
   });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
-  eq(res && res.url, '/products/centrum-200', 'predictive #1 preferred over full-text top when ASIN not in product data');
-  ok(res && res.matched === true && res.via === 'predictive', 'predictive fallback flagged matched');
+  eq(res && res.url, '/products/centrum-200', 'predictive result preferred over full-text top');
+  ok(res && res.matched === false, 'multiple candidates + ASIN not in data -> flagged unverified');
+
+  // dropy DOESN'T carry the product: predictive returns a WRONG product (CeraVe)
+  // and full-text returns junk. Must be flagged unverified, not silently accepted.
+  install({
+    products: [{ handle: 'cerave', url: '/products/cerave' }], // wrong predictive match
+    dom: ['oil-1', 'oil-2', 'cerave'], // fuzzy full-text junk
+    js: { cerave: { handle: 'cerave', title: 'CeraVe', variants: [{ sku: 'X', barcode: '' }] }, 'oil-1': { handle: 'oil-1', variants: [{ sku: 'Y', barcode: '' }] }, 'oil-2': { handle: 'oil-2', variants: [{ sku: 'Z', barcode: '' }] } },
+    html: { cerave: '<html>c</html>', 'oil-1': '<html>o</html>', 'oil-2': '<html>o</html>' },
+  });
+  res = await sandbox.findDropyProductByAsin('B09FRC4F1K');
+  ok(res && res.matched === false, 'wrong fuzzy match (dropy lacks product) flagged unverified');
+
+  // Single clean candidate (predictive found one, full-text 0) -> trusted.
+  install({
+    title: 'Search: 0 results found', bodyText: 'No results found.',
+    products: [{ handle: 'centrum-200', url: '/products/centrum-200' }], dom: [],
+    js: { 'centrum-200': { handle: 'centrum-200', title: 'Centrum', variants: [{ sku: 'INTERNAL', barcode: '' }] } },
+    html: { 'centrum-200': '<html>c</html>' },
+  });
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  eq(res && res.url, '/products/centrum-200', 'sole predictive candidate -> picked');
+  ok(res && res.matched === true, 'sole unambiguous candidate -> trusted');
 
   // "0 results" page (Enter) but predictive box HAS the product: the recommended
   // /products/ links on the empty page must be ignored; predictive wins.

@@ -260,12 +260,12 @@ async function findDropyProductByAsin(asin) {
         if (has(await hr.text())) return { url: p.url, matched: true, via: 'html' };
       } catch (e) { /* try next candidate */ }
     }
-    // No literal ASIN in the product data — trust the TOP result the search
-    // returned. Predictive #1 (or a sole result) is what the store's search
-    // matched to the ASIN, so treat it as a match; only an ambiguous multi-result
-    // full-text top is flagged unverified.
+    // No literal ASIN in the product data. Only trust the top result when dropy
+    // returned EXACTLY ONE candidate (unambiguous — e.g. predictive found one and
+    // full-text had 0). If there's a pile of fuzzy results (dropy doesn't actually
+    // carry this ASIN), flag it ⚠ so a wrong product isn't silently accepted.
     const best = cands[0];
-    return { url: best.url, matched: !!best.predictive || cands.length === 1, via: best.predictive ? 'predictive' : 'search' };
+    return { url: best.url, matched: cands.length === 1, via: best.predictive ? 'predictive' : 'search' };
   } catch (e) {
     return challenged() ? { blocked: true } : { error: e.message };
   }
