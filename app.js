@@ -297,17 +297,17 @@ clearLogBtn.addEventListener('click', () => {
   document.getElementById('logArea').innerHTML = '';
 });
 
-// Results-screen cleanup: deletes ONLY this run's temporary Lens search images.
-// Your review photos (in the CSV) are never touched here.
+// Results-screen: delete THIS run's review photos (for a run you're not importing).
+// Temporary Lens search images are cleaned up automatically at the end of the run.
 clearImagesBtn.addEventListener('click', async () => {
-  if (!runSearchIds.length) return;
-  if (!confirm(`Delete ${runSearchIds.length} temporary Lens search image(s) from Shopify Files?\n\nYour review photos are NOT affected. Can't be undone.`)) return;
+  if (!runReviewIds.length) return;
+  if (!confirm(`⚠ Delete this run's ${runReviewIds.length} review photo(s) from Shopify Files?\n\nThis BREAKS these images if you've already imported this run's CSV. Only do it for a run you did NOT import. Can't be undone.`)) return;
   clearImagesBtn.disabled = true;
   clearImagesBtn.textContent = 'Deleting...';
-  const res = await deleteShopifyImages(runSearchIds);
-  await removeFromStore('search', runSearchIds);
-  log(`Deleted ${res.deleted || 0} temporary search image(s) from Shopify`, res.ok ? 'success' : 'warn');
-  runSearchIds = [];
+  const res = await deleteShopifyImages(runReviewIds);
+  await removeFromStore('review', runReviewIds);
+  log(`Deleted ${res.deleted || 0} review photo(s) from Shopify`, res.ok ? 'success' : 'warn');
+  runReviewIds = [];
   clearImagesBtn.disabled = false;
   clearImagesBtn.classList.add('hidden');
 });
@@ -779,6 +779,9 @@ async function startProcessing() {
   } else if (csvBatch.rows.length) {
     log(`No new reviews this run — ${csvBatch.fileName} already saved (not re-downloaded)`, 'info');
   }
+
+  // Auto-delete the run's temporary Lens search images (disposable, never in the CSV).
+  await autoCleanSearchImages();
 
   // Close Gemini tab + the shared scraping tab
   if (geminiTabId) {
@@ -1634,10 +1637,10 @@ function showResults(results) {
       </div>`;
   }).join('');
 
-  // Offer to clean up only this run's temporary Lens search images (safe).
-  if (runSearchIds.length) {
+  // Offer to delete THIS run's review photos (only useful if you're not importing it).
+  if (runReviewIds.length) {
     clearImagesBtn.classList.remove('hidden');
-    clearImagesBtn.textContent = `🧹 Delete ${runSearchIds.length} temporary Lens search image(s) (safe — keeps review photos)`;
+    clearImagesBtn.textContent = `🗑 Delete this run's ${runReviewIds.length} review photo(s) (⚠ only if not imported)`;
   } else {
     clearImagesBtn.classList.add('hidden');
   }
@@ -1844,24 +1847,25 @@ function updateUploadedUi() {
   const el = document.getElementById('uploadedInfo');
   if (!el) return;
   getUploads().then((store) => {
-    el.textContent = (store.review.length || store.search.length)
-      ? `${store.review.length} review photo(s) + ${store.search.length} temp search image(s) on Shopify (all runs).`
-      : 'No images uploaded yet.';
+    const extra = store.search.length ? ` (+${store.search.length} temp not yet cleaned)` : '';
+    el.textContent = store.review.length
+      ? `${store.review.length} review photo(s) hosted on Shopify (all runs).${extra}`
+      : 'No review photos uploaded yet.' + extra;
   });
 }
-// Safe: delete only temporary Lens search images (never the review photos).
-async function deleteAllSearchImages() {
+// Automatically delete temporary Lens search images — they're disposable (used
+// only to run the Lens search) and never referenced by the CSV. Called at the
+// end of every run; also mops up any left by a prior interrupted run. Silent.
+async function autoCleanSearchImages() {
   const store = await getUploads();
-  if (!store.search.length) { alert('No temporary search images are tracked.'); return; }
-  if (!confirm(`Delete all ${store.search.length} temporary Lens search image(s) from Shopify Files?\n\nReview photos are NOT affected. Can't be undone.`)) return;
-  const btn = document.getElementById('cleanSearchBtn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Deleting...'; }
+  if (!store.search.length) return;
   const res = await deleteShopifyImages(store.search);
-  await setUploads(Object.assign(store, { search: [] }));
+  if (res && res.ok) {
+    await setUploads(Object.assign(store, { search: [] }));
+    if (res.deleted) log(`Cleaned up ${res.deleted} temporary Lens search image(s)`, 'info');
+  }
   runSearchIds = [];
   updateUploadedUi();
-  if (btn) { btn.disabled = false; btn.textContent = '🧹 Delete temporary Lens search images (safe)'; }
-  alert(`Deleted ${res.deleted || 0} temporary search image(s).`);
 }
 // Dangerous: deletes the review photos used in your CSV — breaks imported reviews.
 async function deleteReviewImages() {
@@ -1874,7 +1878,7 @@ async function deleteReviewImages() {
   await setUploads(Object.assign(store, { review: [] }));
   runReviewIds = [];
   updateUploadedUi();
-  if (btn) { btn.disabled = false; btn.textContent = '🗑 Delete review photos (⚠ breaks imported reviews)'; }
+  if (btn) { btn.disabled = false; btn.textContent = '🗑 Delete ALL review photos (⚠ breaks imported reviews)'; }
   alert(`Deleted ${res.deleted || 0} review photo(s).`);
 }
 
@@ -1934,8 +1938,6 @@ function initDashboard() {
   if (ch) ch.addEventListener('click', () => { try { chrome.storage.local.set({ history: [] }); } catch (e) {} renderHistory(); });
   const rp = document.getElementById('resetProgressBtn');
   if (rp) rp.addEventListener('click', () => { if (confirm('Forget all completed ASINs and reprocess them next run?')) resetProgress(); });
-  const cs = document.getElementById('cleanSearchBtn');
-  if (cs) cs.addEventListener('click', deleteAllSearchImages);
   const dr = document.getElementById('deleteReviewBtn');
   if (dr) dr.addEventListener('click', deleteReviewImages);
   updateUploadedUi();
