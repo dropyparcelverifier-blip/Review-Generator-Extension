@@ -222,16 +222,26 @@ async function findDropyProductByAsin(asin) {
     const j = await r.json();
     const products = (j && j.resources && j.resources.results && j.resources.results.products) || [];
     if (!products.length) return challenged() ? { blocked: true } : { none: true };
-    // Prefer the candidate whose product JSON actually contains the ASIN.
-    for (const p of products.slice(0, 8)) {
-      if (!p || !p.handle) continue;
+    const cands = products.slice(0, 8).filter((p) => p && p.handle);
+    // Pass 1 (fast): check each candidate's product JSON for the ASIN.
+    for (const p of cands) {
       try {
         const pr = await fetch('/products/' + p.handle + '.js', { headers: { Accept: 'application/json' } });
         if (!pr.ok) continue;
         const pj = await pr.json();
         const hay = [pj.handle, pj.title, pj.vendor, pj.body_html, (pj.tags || []).join(' '),
           (pj.variants || []).map((v) => (v.sku || '') + ' ' + (v.barcode || '')).join(' ')].join(' ');
-        if (has(hay)) return { url: p.url, matched: true };
+        if (has(hay)) return { url: p.url, matched: true, via: 'json' };
+      } catch (e) { /* try next candidate */ }
+    }
+    // Pass 2 (stronger): fetch the top few candidates' full product HTML — catches
+    // an ASIN stored in a Shopify metafield / JSON-LD / page content that the .js
+    // endpoint omits.
+    for (const p of cands.slice(0, 3)) {
+      try {
+        const hr = await fetch('/products/' + p.handle, { headers: { Accept: 'text/html' } });
+        if (!hr.ok) continue;
+        if (has(await hr.text())) return { url: p.url, matched: true, via: 'html' };
       } catch (e) { /* try next candidate */ }
     }
     // No exact ASIN match found — fall back to the top predictive result, flagged.

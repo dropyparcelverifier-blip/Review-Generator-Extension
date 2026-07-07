@@ -71,49 +71,75 @@ ok(Date.now() - t0 < 200, 'regex fast on long input (no catastrophic backtrackin
 
 // ---- findDropyProductByAsin: predictive search + ASIN confirmation ----
 sandbox.document = { title: '', body: { innerText: '' } };
-function routeFetch(routes) {
+// Handle-aware fetch mock: routes /search/suggest.json, /products/<handle>.js, and
+// /products/<handle> (HTML) independently.
+function installFetch({ products = [], suggestOk = true, js = {}, html = {} }) {
   sandbox.fetch = (url) => {
-    const key = Object.keys(routes).find((k) => url.includes(k));
-    if (!key) return Promise.resolve({ ok: false });
-    const v = routes[key];
-    if (v === '__notok__') return Promise.resolve({ ok: false });
-    return Promise.resolve({ ok: true, json: () => Promise.resolve(v) });
+    if (url.includes('/search/suggest.json')) {
+      return suggestOk
+        ? Promise.resolve({ ok: true, json: () => Promise.resolve({ resources: { results: { products } } }) })
+        : Promise.resolve({ ok: false });
+    }
+    const path = url.split('?')[0];
+    const isJs = path.endsWith('.js');
+    const handle = path.replace(/^.*\/products\//, '').replace(/\.js$/, '');
+    if (isJs) return (handle in js) ? Promise.resolve({ ok: true, json: () => Promise.resolve(js[handle]) }) : Promise.resolve({ ok: false });
+    return (handle in html) ? Promise.resolve({ ok: true, text: () => Promise.resolve(html[handle]) }) : Promise.resolve({ ok: false });
   };
 }
 (async () => {
-  const suggest = (products) => ({ 'search/suggest.json': { resources: { results: { products } } } });
-
-  // Screenshot scenario: screws ranked first, ASIN lives in the Centrum SKU.
-  routeFetch(Object.assign(
-    suggest([
+  // JSON pass — screenshot scenario: screws ranked first, ASIN in Centrum SKU.
+  installFetch({
+    products: [
       { handle: 'tjfujie-screws', url: '/products/tjfujie-screws' },
-      { handle: 'centrum-adult-multivitamin-200-tablets', url: '/products/centrum-adult-multivitamin-200-tablets' },
-    ]),
-    { 'tjfujie-screws.js': { handle: 'tjfujie-screws', title: 'Tjfujie Screws', tags: [], body_html: 'screws', variants: [{ sku: 'TJ-1', barcode: '' }] } },
-    { 'centrum-adult-multivitamin-200-tablets.js': { handle: 'centrum-adult-multivitamin-200-tablets', title: 'Centrum Adult Multivitamin', tags: ['vitamins'], body_html: 'multivitamin', variants: [{ sku: 'B09BVYY7XR', barcode: '' }] } },
-  ));
+      { handle: 'centrum-200', url: '/products/centrum-200' },
+    ],
+    js: {
+      'tjfujie-screws': { handle: 'tjfujie-screws', title: 'Tjfujie Screws', tags: [], body_html: 'screws', variants: [{ sku: 'TJ-1', barcode: '' }] },
+      'centrum-200': { handle: 'centrum-200', title: 'Centrum Adult Multivitamin', tags: ['vitamins'], body_html: 'multivitamin', variants: [{ sku: 'B09BVYY7XR', barcode: '' }] },
+    },
+  });
   let res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
-  eq(res && res.url, '/products/centrum-adult-multivitamin-200-tablets', 'picks ASIN-matching product, NOT the first (screws)');
-  ok(res && res.matched === true, 'match flagged verified');
+  eq(res && res.url, '/products/centrum-200', 'JSON pass: picks ASIN-matching product, not first (screws)');
+  ok(res && res.matched === true && res.via === 'json', 'JSON pass: matched via json');
 
-  // No candidate contains the ASIN -> top result, unmatched
-  routeFetch(Object.assign(
-    suggest([{ handle: 'a', url: '/products/a' }, { handle: 'b', url: '/products/b' }]),
-    { 'a.js': { handle: 'a', title: 'A', variants: [{ sku: 'X', barcode: '' }] } },
-    { 'b.js': { handle: 'b', title: 'B', variants: [{ sku: 'Y', barcode: '' }] } },
-  ));
+  // HTML pass — ASIN absent from every .js but present in a product's HTML.
+  installFetch({
+    products: [
+      { handle: 'aaa', url: '/products/aaa' },
+      { handle: 'right', url: '/products/right' },
+    ],
+    js: {
+      aaa: { handle: 'aaa', title: 'A', variants: [{ sku: 'X', barcode: '' }] },
+      right: { handle: 'right', title: 'Right Product', variants: [{ sku: 'INTERNAL', barcode: '' }] },
+    },
+    html: {
+      aaa: '<html>nothing relevant here</html>',
+      right: '<html><script type="application/ld+json">{"sku":"B09BVYY7XR"}</script></html>',
+    },
+  });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
-  eq(res && res.url, '/products/a', 'no ASIN match -> falls back to top predictive result');
+  eq(res && res.url, '/products/right', 'HTML pass: finds ASIN in product HTML when absent from .js');
+  ok(res && res.matched === true && res.via === 'html', 'HTML pass: matched via html');
+
+  // No match anywhere -> top predictive result, flagged unmatched.
+  installFetch({
+    products: [{ handle: 'a', url: '/products/a' }, { handle: 'b', url: '/products/b' }],
+    js: { a: { handle: 'a', variants: [{ sku: 'X' }] }, b: { handle: 'b', variants: [{ sku: 'Y' }] } },
+    html: { a: '<html>a</html>', b: '<html>b</html>' },
+  });
+  res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
+  eq(res && res.url, '/products/a', 'no ASIN match anywhere -> falls back to top predictive result');
   ok(res && res.matched === false, 'fallback flagged unmatched');
 
-  // Empty predictive results, no challenge -> none
-  routeFetch(suggest([]));
+  // Empty predictive results, no challenge -> none.
+  installFetch({ products: [] });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
   ok(res && res.none === true, 'empty predictive results -> none');
 
-  // Cloudflare: suggest not ok + challenge text -> blocked
+  // Cloudflare: suggest not ok + challenge text -> blocked.
   sandbox.document = { title: 'Just a moment...', body: { innerText: 'Checking your browser before accessing' } };
-  routeFetch({ 'search/suggest.json': '__notok__' });
+  installFetch({ suggestOk: false });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
   ok(res && res.blocked === true, 'suggest blocked + challenge text -> blocked');
 
