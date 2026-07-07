@@ -221,7 +221,15 @@ async function findDropyProductByAsin(asin) {
     //    and what clicking the top result gives. It ranks the exact-ASIN product
     //    highest, so it's both the priority and the fallback.
     try {
-      const r = await fetch('/search/suggest.json?q=' + encodeURIComponent(asin) + '&resources[type]=product&resources[limit]=10', { headers: { Accept: 'application/json' } });
+      // IMPORTANT: include SKU/barcode/tag in the searched fields. The storefront
+      // predictive dropdown searches variants.sku (where the ASIN lives), but
+      // suggest.json's DEFAULT fields are only title/product_type/vendor — so
+      // without this the ASIN wouldn't match and a wrong product came back.
+      const r = await fetch('/search/suggest.json?q=' + encodeURIComponent(asin) +
+        '&resources[type]=product&resources[limit]=10' +
+        '&resources[options][unavailable_products]=last' +
+        '&resources[options][fields]=title,product_type,variants.title,variants.sku,variants.barcode,vendor,tag',
+        { headers: { Accept: 'application/json' } });
       if (r.ok) {
         const j = await r.json();
         ((j && j.resources && j.resources.results && j.resources.results.products) || []).forEach((p) => p && addUrl(p.url || (p.handle && '/products/' + p.handle), true));
