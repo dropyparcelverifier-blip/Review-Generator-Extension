@@ -618,6 +618,7 @@ async function startProcessing(mode) {
   runMode = mode === 'image' ? 'image' : 'text';
   lastMode = runMode;
   doneAsins = runMode === 'image' ? doneAsinsImage : doneAsinsText;
+  csvSinceFlush = 0; csvLastFlushAt = 0; // fresh throttle each run (1st product flushes)
   isProcessing = true;
   isPaused = false;
   showStep('step-processing');
@@ -737,8 +738,7 @@ async function startProcessing(mode) {
         csvBatch.written = false;         // new rows not on disk yet
         const persistedOk = await saveCsvBatch();
         if (persistedOk) markDone(item.asin);
-        flushCsvToDisk();                 // overwrite <name>.csv on disk now
-        await saveCsvBatch();             // remember written=true
+        if (maybeFlushCsvToDisk()) await saveCsvBatch(); // throttled disk write; persist written=true only if it wrote
       }
 
       stats.done++;
@@ -875,8 +875,7 @@ async function startProcessing(mode) {
       delete csvBatch.pending[job.item.asin]; // selection consumed — no longer needed
       const persisted = await saveCsvBatch();
       if (persisted) markDone(job.item.asin);
-      flushCsvToDisk();          // crash-proof: write <name>_images.csv to disk now
-      await saveCsvBatch();      // remember written=true
+      if (maybeFlushCsvToDisk()) await saveCsvBatch(); // throttled disk write; persist written=true only if it wrote
     } else if ((job.selected || []).length === 0) {
       // User deliberately picked NO photos for this product → record it as handled
       // so it isn't re-scraped/re-prompted (and doesn't loop generating 0 reviews)
@@ -1711,6 +1710,26 @@ function flushCsvToDisk() {
   if (!csvBatch || !csvBatch.rows.length) return;
   writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
   csvBatch.written = true;
+}
+
+// Throttled crash-proof write: keeps the on-disk file fresh WITHOUT one download
+// entry per product. Writes on the first product, then at most every N products or
+// every ~30s. The run-end safety net still writes if the last product was
+// throttled (so the final file is always complete). Returns true if it wrote.
+const CSV_FLUSH_EVERY = 5;
+const CSV_FLUSH_MS = 30000;
+let csvSinceFlush = 0;
+let csvLastFlushAt = 0;
+function maybeFlushCsvToDisk(force) {
+  csvSinceFlush++;
+  const now = Date.now();
+  if (force || csvSinceFlush >= CSV_FLUSH_EVERY || (now - csvLastFlushAt) >= CSV_FLUSH_MS) {
+    flushCsvToDisk();
+    csvSinceFlush = 0;
+    csvLastFlushAt = now;
+    return true;
+  }
+  return false;
 }
 
 function downloadCsvFallback(csv, fileName) {

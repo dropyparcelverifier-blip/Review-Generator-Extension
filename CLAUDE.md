@@ -56,10 +56,13 @@ Both: 1) upload `.txt/.csv/.xlsx` → `extractAsin` → `products`; 4) **one CSV
   `rows` accumulate; `pending` holds saved image selections by ASIN (image mode only).
   Persisted after each product (crash-safe); an ASIN is marked done only after rows persist.
   The active mode's key is chosen by `doneStoreKey()` / `csvStoreKey()`.
-- **Crash-proof disk file:** `flushCsvToDisk()` (over)writes the CSV to disk after EACH
-  product, not just at run end — a power loss mid-run leaves a complete file on disk,
-  no resume needed. `written` is set true only AFTER the file is actually sent, so
-  storage never claims "on disk" when it isn't. Run-end write is now just a safety net.
+- **Crash-proof disk file:** `maybeFlushCsvToDisk()` (over)writes the CSV to disk during
+  the run — on the 1st product, then throttled to at most every `CSV_FLUSH_EVERY` (5)
+  products or `CSV_FLUSH_MS` (30s) — so a power loss mid-run leaves a near-complete file
+  on disk without a resume run, while avoiding one download entry per product. `written`
+  is set true only AFTER the file is actually sent (and persisted only when it wrote), so
+  storage never claims "on disk" when it isn't. The run-end write is the safety net that
+  guarantees the final file is complete even if the last product was throttled.
 - `settings`, `history`, `uploadedFileIds` (Shopify file GIDs for cleanup).
 - `chrome.storage.session` mirrors scrape-tab ids so a SW restart can't orphan tabs.
 

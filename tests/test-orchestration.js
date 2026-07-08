@@ -235,7 +235,7 @@ async function run() {
   eq(s.prepareCalls, ['A', 'B', 'C'], 'T1 every product looked up, in order');
   eq(s.pickCount, 0, 'T1 text mode NEVER opens the image picker');
   eq(s.rows, ['r:A:0', 'r:B:0', 'r:C:0'], 'T1 rows one per product');
-  ok(saved.length >= 3, 'T1 CSV flushed to disk per product (crash-proof, >=3 writes)');
+  ok(saved.length >= 1 && saved.length <= 3, 'T1 CSV written to disk, throttled (not one per product)');
   eq(localStore.doneAsins.sort(), ['A', 'B', 'C'], 'T1 all marked done (text key)');
   ok(!localStore.doneAsinsImage, 'T1 text run does NOT touch the image done-key');
   ok(/^reviews_/.test(s.fileName) && !/_images/.test(s.fileName), 'T1 plain (non-image) filename');
@@ -266,6 +266,15 @@ async function run() {
   s = T.snap();
   eq(s.rows, ['r:A:0'], 'T4 stop-in-gen: first product saved');
   eq(localStore.doneAsins, ['A'], 'T4 only first marked done');
+
+  // T5 disk-write throttle: a big run must NOT write once per product
+  resetStore(); T.setProducts(P('A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'));
+  T.install({});
+  await T.startProcessing('text');
+  s = T.snap();
+  eq(s.rows.length, 12, 'T5 all 12 products generated');
+  ok(saved.length >= 2 && saved.length <= 6, 'T5 12-product run throttles disk writes to a handful (flush @1,6,11 + run-end), not 12');
+  eq(localStore.doneAsins.length, 12, 'T5 all 12 marked done');
 
   // ============================================================
   // CROSS-MODE ISOLATION (X1) — a text run and an image run over the SAME list
