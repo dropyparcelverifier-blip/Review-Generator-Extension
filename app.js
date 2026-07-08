@@ -1833,11 +1833,13 @@ function showResults(results) {
   const issues = results.length - doneCount;
   const elapsed = fmtTime(Date.now() - stats.startTime);
 
-  // Summary metric cards
+  // Summary metric cards. Text runs never attach photos, so skip the Images card
+  // (a permanent 0 there is just noise) unless the run actually produced some.
+  const showImages = runMode === 'image' || totalImages > 0;
   document.getElementById('summaryGrid').innerHTML = `
     <div class="metric"><div class="metric-value good">${doneCount}/${results.length}</div><div class="metric-label">Products</div></div>
     <div class="metric"><div class="metric-value">${totalReviews}</div><div class="metric-label">Reviews</div></div>
-    <div class="metric"><div class="metric-value">${totalImages}</div><div class="metric-label">Images</div></div>
+    ${showImages ? `<div class="metric"><div class="metric-value">${totalImages}</div><div class="metric-label">Images</div></div>` : ''}
     <div class="metric"><div class="metric-value ${issues ? 'warn' : 'good'}">${issues}</div><div class="metric-label">Issues</div></div>
   `;
 
