@@ -123,10 +123,12 @@ async function hostShopifyFileByUrl(sourceUrl) {
     const node = q && q.data && q.data.node;
     if (node) {
       url = (node.image && node.image.url) || (node.preview && node.preview.image && node.preview.image.url) || '';
-      if (node.fileStatus === 'FAILED') throw new Error('Shopify could not fetch the source image');
+      if (node.fileStatus === 'FAILED') { const e = new Error('Shopify could not fetch the source image'); e.fileId = file.id; throw e; }
     }
   }
-  if (!url) throw new Error('Shopify file URL not ready (still processing)');
+  // File exists but its URL isn't ready — surface the id so the caller can still
+  // track it for cleanup (never leave an un-deletable orphan on the store).
+  if (!url) { const e = new Error('Shopify file URL not ready (still processing)'); e.fileId = file.id; throw e; }
   return { url, id: file.id };
 }
 
@@ -777,6 +779,7 @@ async function uploadReviewImages(sku, images) {
   if (SHOPIFY.domain && SHOPIFY.token) {
     const urls = [];
     const fileIds = [];
+    const createdIds = []; // EVERY Shopify file we created, incl. stranded/pending — for cleanup
     let okCount = 0;
     let fetchFails = 0; // images whose bytes couldn't be fetched (usually CORS/host perm)
     for (let n = 0; n < items.length; n++) {
@@ -792,6 +795,9 @@ async function uploadReviewImages(sku, images) {
           try {
             u = await hostShopifyFileByUrl(it.url);
           } catch (e1) {
+            // A file may have been created even though its URL wasn't ready — track
+            // its id so it can be cleaned up (never orphan it).
+            if (e1 && e1.fileId) createdIds.push(e1.fileId);
             // Shopify couldn't fetch it (e.g. hotlink-blocked). Fall back to
             // downloading the bytes ourselves, then staged upload (needs host perm).
             try {
@@ -803,14 +809,15 @@ async function uploadReviewImages(sku, images) {
             }
           }
         }
+        if (u && u.id) createdIds.push(u.id); // track it whether or not its URL resolved
         if (u && u.url) { urls.push(u.url); fileIds.push(u.id || ''); okCount++; }
         else { urls.push(it.url || ''); fileIds.push(''); }
       } catch (e) {
         urls.push(it.url || ''); fileIds.push('');
       }
     }
-    if (okCount) return { ok: true, configured: true, via: 'shopify', urls, fileIds, hosted: okCount, fetchFails };
-    return { ok: false, configured: true, via: 'shopify', error: 'Shopify upload returned no URLs', urls: sourceUrls, fileIds, hosted: 0, fetchFails };
+    if (okCount) return { ok: true, configured: true, via: 'shopify', urls, fileIds, createdFileIds: createdIds, hosted: okCount, fetchFails };
+    return { ok: false, configured: true, via: 'shopify', error: 'Shopify upload returned no URLs', urls: sourceUrls, fileIds, createdFileIds: createdIds, hosted: 0, fetchFails };
   }
 
   if (!DROPY_UPLOAD.endpoint) {
@@ -1147,8 +1154,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(result);
       } catch (e) {
         // Always answer so the channel never closes silently; fall back to source URLs.
+        // Keep the shape aligned with the success path (fileIds 1:1 with urls).
         const urls = (msg.images || []).map((x) => (typeof x === 'string' ? x : (x && x.url)) || '');
-        sendResponse({ ok: false, configured: true, error: e.message, urls, fileIds: [] });
+        sendResponse({ ok: false, configured: true, error: e.message, urls, fileIds: urls.map(() => ''), createdFileIds: [], hosted: 0, fetchFails: 0 });
       } finally { keepAlive(false); }
     })();
     return true;
@@ -1233,13 +1241,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === 'send_to_gemini') {
     keepAlive(true); // Gemini generation is long — keep the SW alive until it replies
-    chrome.tabs.sendMessage(msg.tabId, {
-      action: 'inject_prompt',
-      prompt: msg.prompt
-    }, (response) => {
-      keepAlive(false);
-      sendResponse(response || { error: chrome.runtime.lastError?.message || 'No response from Gemini' });
-    });
+    try {
+      chrome.tabs.sendMessage(msg.tabId, {
+        action: 'inject_prompt',
+        prompt: msg.prompt
+      }, (response) => {
+        keepAlive(false);
+        sendResponse(response || { error: chrome.runtime.lastError?.message || 'No response from Gemini' });
+      });
+    } catch (e) {
+      keepAlive(false); // sendMessage threw synchronously — release the ref, don't leak
+      sendResponse({ error: 'send failed: ' + e.message });
+    }
     return true;
   }
 

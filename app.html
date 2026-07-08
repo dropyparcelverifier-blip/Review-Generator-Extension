@@ -35,8 +35,8 @@
         </div>
         <div class="upload-zone" id="dropZone">
           <div class="upload-icon">📁</div>
-          <p>Drop .txt file here or <label for="fileInput" class="browse-link">browse</label></p>
-          <p class="hint">One Amazon ASIN per line (e.g. B071HN7KK6)</p>
+          <p>Drop a <b>.txt / .csv / .xlsx</b> file here or <label for="fileInput" class="browse-link">browse</label></p>
+          <p class="hint">One Amazon ASIN per line/cell (e.g. B071HN7KK6)</p>
           <input type="file" id="fileInput" accept=".txt,.csv,.xlsx,.xls" hidden>
         </div>
         <div id="fileInfo" class="file-info hidden">
@@ -159,7 +159,8 @@
         <div class="step-header"><span class="step-num">⚙</span><h2>Settings</h2></div>
 
         <div class="settings-group">
-          <h3>Reviews per product</h3>
+          <h3>Reviews per product <span class="hint" style="font-weight:600">· text mode only</span></h3>
+          <p class="hint">Image mode makes exactly one review per photo you pick, so these don't apply to it.</p>
           <div class="setting-row">
             <label>Min</label><input type="number" id="setMin" min="1" max="500" value="25">
             <label>Max</label><input type="number" id="setMax" min="1" max="500" value="100">

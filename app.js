@@ -740,7 +740,7 @@ async function startProcessing(mode) {
         csvBatch.written = false;         // new rows not on disk yet
         const persistedOk = await saveCsvBatch();
         if (persistedOk) markDone(item.asin);
-        if (maybeFlushCsvToDisk()) await saveCsvBatch(); // throttled disk write; persist written=true only if it wrote
+        if (await maybeFlushCsvToDisk()) await saveCsvBatch(); // throttled disk write; persist written=true only if it wrote
       }
 
       stats.done++;
@@ -864,9 +864,13 @@ async function startProcessing(mode) {
       log(`Error generating ${job.item.asin}: ${err.message}`, 'error');
       result = { asin: job.item.asin, sku: job.item.sku, name: job.productData.name || 'Error', reviews: 0, images: 0, error: err.message };
     }
+    // Carry the unverified flag onto the result so the completion summary flags it
+    // (same as text mode) — an unconfirmed ASIN shouldn't vanish after the run.
+    const unv = job.productData.asinVerified === false;
+    if (unv && (result.reviews || 0) > 0) result.unverified = true;
     results.push(result);
     updateAsinRow(job.i, classifyResult(result), result.name,
-      `${result.reviews || 0} rev${result.images ? ` · ${result.images} img` : ''}`);
+      `${result.reviews || 0} rev${result.images ? ` · ${result.images} img` : ''}${unv ? ' · ⚠ unverified' : ''}`);
 
     // Persist rows to storage and mark done AS EACH product finishes, so closing
     // the panel mid-generation loses nothing and completed ASINs skip on resume
@@ -877,7 +881,7 @@ async function startProcessing(mode) {
       delete csvBatch.pending[job.item.asin]; // selection consumed — no longer needed
       const persisted = await saveCsvBatch();
       if (persisted) markDone(job.item.asin);
-      if (maybeFlushCsvToDisk()) await saveCsvBatch(); // throttled disk write; persist written=true only if it wrote
+      if (await maybeFlushCsvToDisk()) await saveCsvBatch(); // throttled disk write; persist written=true only if it wrote
     } else if ((job.selected || []).length === 0) {
       // User deliberately picked NO photos for this product → record it as handled
       // so it isn't re-scraped/re-prompted (and doesn't loop generating 0 reviews)
@@ -907,10 +911,13 @@ async function startProcessing(mode) {
   // this is a safety net: only (re)write if a per-product flush didn't land.
   const addedThisRun = csvBatch.rows.length - rowsBefore;
   if (csvBatch.rows.length && !csvBatch.written) {
-    writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
-    csvBatch.written = true;
+    const ok = await writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
+    csvBatch.written = !!ok;
     await saveCsvBatch();
-    log(`✅ ${csvBatch.fileName} saved — ${addedThisRun} new this run, ${csvBatch.rows.length} reviews total in the file`, 'success');
+    log(ok
+      ? `✅ ${csvBatch.fileName} saved — ${addedThisRun} new this run, ${csvBatch.rows.length} reviews total in the file`
+      : `⚠ Couldn't write ${csvBatch.fileName} to disk — the reviews are saved inside the extension and will be written on the next run of this list.`,
+      ok ? 'success' : 'warn');
   } else if (csvBatch.rows.length) {
     const msg = addedThisRun > 0
       ? `✅ ${csvBatch.fileName} — ${addedThisRun} new this run, ${csvBatch.rows.length} total (written to disk as it ran)`
@@ -1207,7 +1214,9 @@ async function generateProduct(job) {
       log(`Hosting ${uploadIdx.length} image(s) on Shopify...`, 'info');
       const up = await bg({ action: 'upload_images', sku, images: uploadIdx.map((i) => selected[i]) });
       hosted = up.urls || [];
-      uploadedIds = up.fileIds || [];
+      // Track EVERY file we created on Shopify (incl. any created-but-stranded when
+      // its URL wasn't ready) so cleanup can reach them all — never orphan a file.
+      uploadedIds = up.createdFileIds || up.fileIds || [];
       if (up.ok) log(`Hosted ${hosted.filter(Boolean).length} image(s)`, 'success');
       else if (up.configured === false) log('Shopify not configured — using source URLs', 'warn');
       else log('Host failed — using source URLs' + (up.error ? ': ' + up.error : ''), 'warn');
@@ -1690,56 +1699,63 @@ function buildCsvRows(reviews, productSku, imageItems) {
 }
 
 // Writes ONE CSV file containing all rows accumulated across the run.
+// Resolves TRUE only if the file was actually written (save_file OK, or the Blob
+// fallback completed) — so callers never mark `written` when the write failed.
 function writeCombinedCsv(rows, fileName) {
   const csv = [CSV_HEADERS.join(',')].concat(rows).join('\r\n');
-
-  // Save silently via chrome.downloads (saveAs:false) — no "Save As" prompt.
-  // UTF-8 data URL keeps any emojis intact. Falls back to a Blob download.
-  try {
-    const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
-    // overwrite (not uniquify) so resuming a batch keeps ONE file, not copies.
-    chrome.runtime.sendMessage({ action: 'save_file', filename: fileName, dataUrl, conflictAction: 'overwrite' }, (resp) => {
-      if (chrome.runtime.lastError || !resp || !resp.ok) {
-        downloadCsvFallback(csv, fileName);
-      }
-    });
-  } catch (e) {
-    downloadCsvFallback(csv, fileName);
-  }
+  return new Promise((resolve) => {
+    // Save silently via chrome.downloads (saveAs:false) — no "Save As" prompt.
+    // UTF-8 data URL keeps any emojis intact. Falls back to a Blob download.
+    try {
+      const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+      // overwrite (not uniquify) so resuming a batch keeps ONE file, not copies.
+      chrome.runtime.sendMessage({ action: 'save_file', filename: fileName, dataUrl, conflictAction: 'overwrite' }, (resp) => {
+        if (chrome.runtime.lastError || !resp || !resp.ok) {
+          resolve(downloadCsvFallback(csv, fileName));
+        } else {
+          resolve(true);
+        }
+      });
+    } catch (e) {
+      resolve(downloadCsvFallback(csv, fileName));
+    }
+  });
 }
 
 // Crash-proofing: (over)write the batch's CSV to disk RIGHT NOW, as each product
 // finishes — not just at run end. So if an unattended run loses power (or the tab
 // closes) mid-batch, a complete file with everything done-so-far is already on
 // disk, no resume run needed. Uses the same overwrite+stable-name so it stays ONE
-// file. `written` is only set true AFTER the file is actually sent, so storage
-// never claims "on disk" when it isn't.
-function flushCsvToDisk() {
-  if (!csvBatch || !csvBatch.rows.length) return;
-  writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
-  csvBatch.written = true;
+// file. `written` is set true ONLY after the write is confirmed, so storage never
+// claims "on disk" when it isn't (else the run-end net wrongly skips the rewrite).
+async function flushCsvToDisk() {
+  if (!csvBatch || !csvBatch.rows.length) return false;
+  const ok = await writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
+  if (ok) csvBatch.written = true;
+  return ok;
 }
 
 // Throttled crash-proof write: keeps the on-disk file fresh WITHOUT one download
 // entry per product. Writes on the first product, then at most every N products or
 // every ~30s. The run-end safety net still writes if the last product was
-// throttled (so the final file is always complete). Returns true if it wrote.
+// throttled (so the final file is always complete). Resolves true if it wrote.
+// On a failed write the throttle isn't advanced, so the next product retries.
 const CSV_FLUSH_EVERY = 5;
 const CSV_FLUSH_MS = 30000;
 let csvSinceFlush = 0;
 let csvLastFlushAt = 0;
-function maybeFlushCsvToDisk(force) {
+async function maybeFlushCsvToDisk(force) {
   csvSinceFlush++;
   const now = Date.now();
   if (force || csvSinceFlush >= CSV_FLUSH_EVERY || (now - csvLastFlushAt) >= CSV_FLUSH_MS) {
-    flushCsvToDisk();
-    csvSinceFlush = 0;
-    csvLastFlushAt = now;
-    return true;
+    const ok = await flushCsvToDisk();
+    if (ok) { csvSinceFlush = 0; csvLastFlushAt = now; }
+    return ok;
   }
   return false;
 }
 
+// Returns true if the fallback download completed without throwing.
 function downloadCsvFallback(csv, fileName) {
   try {
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -1751,7 +1767,8 @@ function downloadCsvFallback(csv, fileName) {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-  } catch (e) { /* give up */ }
+    return true;
+  } catch (e) { return false; }
 }
 
 // Converts a "YYYY-MM-DD" date into the importer's "YYYY-MM-DD 00:00:00 UTC"
