@@ -36,7 +36,7 @@ globalThis.__t = {
         return { asin: job.item.asin, sku: job.item.sku, name: job.productData.name, reviews: 0, images: 0, error: 'no images picked (skipped)' };
       }
       const s = (spec.gen && spec.gen[job.item.asin]) || { reviews: 1 };
-      const n = s.reviews == null ? 1 : s.reviews;
+      const n = spec.genAllZero ? 0 : (s.reviews == null ? 1 : s.reviews); // genAllZero simulates Gemini logged out
       for (let x = 0; x < n; x++) csvBatch.rows.push('r:' + job.item.asin + ':' + x);
       return { asin: job.item.asin, sku: job.item.sku, name: job.productData.name, reviews: n, images: 0, error: n ? null : 'no reviews' };
     };
@@ -275,6 +275,15 @@ async function run() {
   eq(s.rows.length, 12, 'T5 all 12 products generated');
   ok(saved.length >= 2 && saved.length <= 6, 'T5 12-product run throttles disk writes to a handful (flush @1,6,11 + run-end), not 12');
   eq(localStore.doneAsins.length, 12, 'T5 all 12 marked done');
+
+  // T6 circuit-breaker: Gemini logged out (every product yields 0 reviews) -> stop
+  // after GEN_FAIL_LIMIT (3) products instead of grinding through the whole list.
+  resetStore(); T.setProducts(P('A', 'B', 'C', 'D', 'E', 'F')); T.install({ genAllZero: true });
+  await T.startProcessing('text');
+  s = T.snap();
+  eq(s.rows, [], 'T6 nothing generated (simulated Gemini logout)');
+  eq(s.prepareCalls, ['A', 'B', 'C'], 'T6 stops after 3 systemic failures, not all 6');
+  ok(!localStore.doneAsins || localStore.doneAsins.length === 0, 'T6 nothing marked done');
 
   // ============================================================
   // CROSS-MODE ISOLATION (X1) — a text run and an image run over the SAME list

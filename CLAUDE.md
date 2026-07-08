@@ -118,7 +118,9 @@ those in a real browser.
 ## Gotchas
 - `config.js` is git-ignored — verify with `git check-ignore config.js` before any push.
 - Gemini must be **logged in** in the opened tab or batches fail (there's retry +
-  self-heal, but not for a logged-out account).
+  self-heal, but not for a logged-out account). A circuit-breaker (`checkGenHealth`)
+  stops the run if the first 3 products in a row generate 0 reviews and nothing has
+  succeeded — so a logged-out unattended run doesn't grind out an empty CSV.
 - Files are `app.*` (renamed from `sidepanel.*`). `background.js` opens `app.html`.
 - Git shows harmless `LF will be replaced by CRLF` warnings on Windows.
 - End commit messages with the `Co-Authored-By: Claude` trailer; branch off `main`

@@ -21,6 +21,7 @@ let doneAsinsText = new Set();  // completed ASINs for the TEXT run (persisted)
 let doneAsinsImage = new Set(); // completed ASINs for the IMAGE run (persisted)
 let doneAsins = doneAsinsText;  // points at the ACTIVE mode's set during a run
 let lastMode = 'text';          // mode of the last run (used by Retry)
+let genFailStreak = 0;          // consecutive products that generated 0 reviews (Gemini health)
 let isProcessing = false;
 let isPaused = false;
 let geminiTabId = null;
@@ -609,6 +610,23 @@ function log(message, type = 'info') {
 // MAIN PROCESSING
 // ============================================================
 
+// Circuit-breaker for a systemically-failing run (the classic cause: Gemini is not
+// logged in, so EVERY batch fails after all its retries). If the first few products
+// in a row generate zero reviews and NOTHING has succeeded all run, stop instead of
+// grinding through the whole list producing an empty CSV. Called after each product.
+const GEN_FAIL_LIMIT = 3;
+function checkGenHealth(result) {
+  if ((result.reviews || 0) > 0) { genFailStreak = 0; return; }
+  // An intentional skip (e.g. no photos picked in image mode) isn't a Gemini failure.
+  const e = (result.error || '').toLowerCase();
+  if (e.includes('skipped') || e.includes('no images')) return;
+  genFailStreak++;
+  if (genFailStreak >= GEN_FAIL_LIMIT && stats.reviews === 0 && isProcessing) {
+    log(`⛔ No reviews generated for the first ${GEN_FAIL_LIMIT} products in a row — Gemini is most likely NOT logged in (or is blocked). Open the Gemini tab, sign in at gemini.google.com, then re-run this list (it resumes where it stopped). Stopping now so the whole batch isn't wasted.`, 'error');
+    isProcessing = false;
+  }
+}
+
 async function startProcessing(mode) {
   if (!products.length) {
     alert('No ASINs to process. Please upload a .txt list first.');
@@ -619,6 +637,7 @@ async function startProcessing(mode) {
   lastMode = runMode;
   doneAsins = runMode === 'image' ? doneAsinsImage : doneAsinsText;
   csvSinceFlush = 0; csvLastFlushAt = 0; // fresh throttle each run (1st product flushes)
+  genFailStreak = 0;                     // fresh Gemini-health streak each run
   isProcessing = true;
   isPaused = false;
   showStep('step-processing');
@@ -733,6 +752,7 @@ async function startProcessing(mode) {
       if (unverified) result.unverified = true; // surfaced in results so it isn't missed
       results.push(result);
       updateAsinRow(i, classifyResult(result), result.name, `${result.reviews || 0} rev${unverified ? ' · ⚠ unverified' : ''}`);
+      checkGenHealth(result); // stop early if Gemini is logged out (nothing generating)
 
       // Persist rows + mark done as each product finishes (crash-safe resume) AND
       // write the CSV to disk now (crash-proof the file itself, no resume needed).
@@ -871,6 +891,7 @@ async function startProcessing(mode) {
     results.push(result);
     updateAsinRow(job.i, classifyResult(result), result.name,
       `${result.reviews || 0} rev${result.images ? ` · ${result.images} img` : ''}${unv ? ' · ⚠ unverified' : ''}`);
+    checkGenHealth(result); // stop early if Gemini is logged out (nothing generating)
 
     // Persist rows to storage and mark done AS EACH product finishes, so closing
     // the panel mid-generation loses nothing and completed ASINs skip on resume
