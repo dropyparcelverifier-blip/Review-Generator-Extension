@@ -750,21 +750,29 @@ async function uploadReviewImages(sku, images) {
     const urls = [];
     const fileIds = [];
     let okCount = 0;
+    let fetchFails = 0; // images whose bytes couldn't be fetched (usually CORS/host perm)
     for (let n = 0; n < items.length; n++) {
       const it = items[n];
       try {
         let blob = null;
         if (it.dataUrl) blob = dataUrlToBlob(it.dataUrl);
-        else if (it.url) blob = await (await fetch(it.url)).blob();
+        else if (it.url) {
+          const resp = await fetch(it.url);
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          blob = await resp.blob();
+        }
         if (!blob) { urls.push(it.url || ''); fileIds.push(''); continue; }
         const u = await uploadToShopifyFiles(blob, `review-${sku}-${n + 1}.jpg`);
         urls.push((u && u.url) || it.url || '');
         fileIds.push((u && u.id) || '');
         if (u && u.url) okCount++;
-      } catch (e) { urls.push(it.url || ''); fileIds.push(''); }
+      } catch (e) {
+        if (it.url && !it.dataUrl) fetchFails++; // couldn't fetch the source bytes
+        urls.push(it.url || ''); fileIds.push('');
+      }
     }
-    if (okCount) return { ok: true, configured: true, via: 'shopify', urls, fileIds };
-    return { ok: false, configured: true, via: 'shopify', error: 'Shopify upload returned no URLs', urls: sourceUrls, fileIds };
+    if (okCount) return { ok: true, configured: true, via: 'shopify', urls, fileIds, hosted: okCount, fetchFails };
+    return { ok: false, configured: true, via: 'shopify', error: 'Shopify upload returned no URLs', urls: sourceUrls, fileIds, hosted: 0, fetchFails };
   }
 
   if (!DROPY_UPLOAD.endpoint) {

@@ -25,8 +25,7 @@
     "https://*.myshopify.com/*",
     "https://shopify-staged-uploads.storage.googleapis.com/*",
     "https://*.storage.googleapis.com/*",
-    "https://*/*",
-    "http://*/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"

@@ -1211,6 +1211,11 @@ async function generateProduct(job) {
       if (up.ok) log(`Hosted ${hosted.filter(Boolean).length} image(s)`, 'success');
       else if (up.configured === false) log('Shopify not configured — using source URLs', 'warn');
       else log('Host failed — using source URLs' + (up.error ? ': ' + up.error : ''), 'warn');
+      // A CORS/host-permission failure means the service worker is running with
+      // stale permissions — the fix is a full extension reload, not a code change.
+      if (up.fetchFails) {
+        log(`⚠ ${up.fetchFails} image(s) couldn't be fetched to re-host (used the source URL instead). If this keeps happening, RELOAD the extension at chrome://extensions (click ↻) so the image-fetch permission takes effect.`, 'warn');
+      }
     }
     // Review photos — IN USE by the CSV, so tracked separately from temp images.
     addUploadedIds(uploadedIds, 'review');
