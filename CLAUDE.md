@@ -28,24 +28,34 @@ customer photos and exporting an import-ready CSV.
   Admin token needs `write_files` scope. **Never commit; rotate if exposed.**
 - `libs/xlsx.full.min.js` — Excel parsing for `.xlsx` ASIN lists.
 
-## Run flow (`app.js` → `startProcessing`)
-1. Upload a `.txt/.csv/.xlsx` list → `extractAsin` → `products` (`{asin, sku:"Dropy-<ASIN>"}`).
-2. **Phase 1 — Selection (interactive):** for each product, `prepareProduct` scrapes
-   dropy + gathers candidate images from **Lens, Google Images, Pinterest, Amazon
-   reviews in PARALLEL**; you pick images. A **1-ahead prefetch** scrapes the next
-   product while you pick. Selections are persisted per-ASIN (`csvBatch.pending`) so
-   Stop/close doesn't force a re-pick.
-3. **Phase 2 — Generation (unattended):** `generateProduct` hosts picked images on
-   Shopify Files, fetches an AI Overview, then generates reviews via Gemini in batches
-   and appends rows to the combined CSV.
-4. **One CSV per batch**, written with `conflictAction:'overwrite'` and a stable
-   filename so Stop→resume keeps the SAME file (no `reviews (1).csv`).
+## Run flow (`app.js` → `startProcessing(mode)`)
+Two **independent** run modes, each its own button on the upload screen, each with
+its own progress + output file (run text now, images later — order doesn't matter):
 
-## Persistence (`chrome.storage.local`)
-- `doneAsins` — completed ASINs, skipped on re-run (resume).
-- `csvBatch` — `{ fileName, rows, asins, pending }`. `rows` accumulate; `pending` holds
-  saved image selections by ASIN. Persisted after each product (crash-safe); an ASIN is
-  marked done only after its rows persist.
+- **Text mode** (`startProcessing('text')`, default) — **fully automatic, no image
+  picking.** For each ASIN: `prepareProduct(item, i, /*textOnly*/true)` does ONLY the
+  dropy lookup (skips all image search), then `generateProduct({…, mode:'text'})`
+  generates the configured min–max **text-only** reviews and streams rows into
+  **`<name>.csv`**. Unattended — the user walks away.
+- **Image mode** (`startProcessing('image')`) — the interactive two-phase pipeline:
+  - **Phase 1 — Selection:** `prepareProduct` scrapes dropy + gathers candidate images
+    from **Lens, Google Images, Pinterest, Amazon reviews in PARALLEL**; you pick. A
+    **1-ahead prefetch** scrapes the next product while you pick. Selections persist
+    per-ASIN (`csvBatchImage.pending`) so Stop/close doesn't force a re-pick.
+  - **Phase 2 — Generation (unattended):** `generateProduct({…, mode:'image'})` hosts
+    picked images on Shopify Files, then generates **exactly one review per hosted
+    photo** (every review carries a photo) → **`<name>_images.csv`**.
+
+Both: 1) upload `.txt/.csv/.xlsx` → `extractAsin` → `products`; 4) **one CSV per batch**,
+`conflictAction:'overwrite'` + stable filename so Stop→resume keeps the SAME file.
+
+## Persistence (`chrome.storage.local`) — **namespaced by mode**
+- `doneAsins` (text) / `doneAsinsImage` (image) — completed ASINs per mode, skipped on
+  re-run. Separate so a text run never makes the image run skip that ASIN (or vice-versa).
+- `csvBatch` (text) / `csvBatchImage` (image) — `{ fileName, rows, asins, pending }`.
+  `rows` accumulate; `pending` holds saved image selections by ASIN (image mode only).
+  Persisted after each product (crash-safe); an ASIN is marked done only after rows persist.
+  The active mode's key is chosen by `doneStoreKey()` / `csvStoreKey()`.
 - `settings`, `history`, `uploadedFileIds` (Shopify file GIDs for cleanup).
 - `chrome.storage.session` mirrors scrape-tab ids so a SW restart can't orphan tabs.
 

@@ -28,16 +28,22 @@ globalThis.__t = {
       return { productData: { name: 'P-' + item.asin, brand: '', lensText: '' }, candidates: s.candidates || [{url:'u',thumb:'t'}], refImg: '', refFull: '' };
     };
     generateProduct = async (job) => {
+      globalThis.__genCount++;
+      if (spec.stopAfterGen && globalThis.__genCount >= spec.stopAfterGen) isProcessing = false;
+      // Mirror the real image-mode behavior: an empty photo selection generates
+      // nothing (0 reviews) and returns the "skipped" marker.
+      if (job.mode === 'image' && (job.selected || []).length === 0) {
+        return { asin: job.item.asin, sku: job.item.sku, name: job.productData.name, reviews: 0, images: 0, error: 'no images picked (skipped)' };
+      }
       const s = (spec.gen && spec.gen[job.item.asin]) || { reviews: 1 };
       const n = s.reviews == null ? 1 : s.reviews;
       for (let x = 0; x < n; x++) csvBatch.rows.push('r:' + job.item.asin + ':' + x);
-      globalThis.__genCount++;
-      if (spec.stopAfterGen && globalThis.__genCount >= spec.stopAfterGen) isProcessing = false;
       return { asin: job.item.asin, sku: job.item.sku, name: job.productData.name, reviews: n, images: 0, error: n ? null : 'no reviews' };
     };
     pickImages = async (cands) => {
       globalThis.__pickCount++;
       if (spec.stopAfterPick && globalThis.__pickCount >= spec.stopAfterPick) isProcessing = false;
+      if (spec.pickEmpty) return []; // simulate the user picking NO photos
       return (cands || []).slice(0, 1);
     };
     sleep = async () => {};
@@ -48,6 +54,7 @@ globalThis.__t = {
     rows: csvBatch ? csvBatch.rows.slice() : null,
     fileName: csvBatch ? csvBatch.fileName : null,
     asins: csvBatch ? csvBatch.asins : null,
+    pickCount: globalThis.__pickCount,
   }),
 };
 `;
@@ -95,114 +102,188 @@ function resetStore() { for (const k in localStore) delete localStore[k]; saved.
 const P = (...a) => a.map(x => ({ asin: x, sku: 'Dropy-' + x }));
 
 async function run() {
+  // ============================================================
+  // IMAGE MODE (S1-S11) — drives the interactive pick pipeline. Progress lives
+  // under doneAsinsImage / csvBatchImage; the file gets a "_images" suffix.
+  // ============================================================
   // S1 happy path
   resetStore(); T.setSettings({ min: 5, max: 5, batch: 10 });
   T.setProducts(P('A', 'B', 'C'));
   T.install({});
-  await T.startProcessing();
+  await T.startProcessing('image');
   let s = T.snap();
   eq(s.prepareCalls, ['A', 'B', 'C'], 'S1 prepare called once each, in order');
   eq(s.rows, ['r:A:0', 'r:B:0', 'r:C:0'], 'S1 rows one per product');
-  eq(localStore.doneAsins.sort(), ['A', 'B', 'C'], 'S1 all marked done');
+  eq(localStore.doneAsinsImage.sort(), ['A', 'B', 'C'], 'S1 all marked done (image key)');
+  ok(!localStore.doneAsins, 'S1 image run does NOT touch the text done-key');
   ok(saved.length >= 1 && saved[saved.length - 1].conflictAction === 'overwrite', 'S1 file saved with overwrite');
-  ok(/^reviews_/.test(s.fileName), 'S1 stable filename');
+  ok(/^reviews_images_/.test(s.fileName), 'S1 stable _images filename');
 
   // S2 middle product not found (skip) — prefetch stays aligned
   resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({ prep: { B: { skip: true } } });
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
   eq(s.prepareCalls, ['A', 'B', 'C'], 'S2 prepare still called for all incl skipped');
   eq(s.rows, ['r:A:0', 'r:C:0'], 'S2 only A and C generated');
-  eq(localStore.doneAsins.sort(), ['A', 'C'], 'S2 skipped B not marked done');
+  eq(localStore.doneAsinsImage.sort(), ['A', 'C'], 'S2 skipped B not marked done');
 
-  // S3 resume: A already done, csvBatch persisted with prior rows + asins
+  // S3 resume: A already done, csvBatchImage persisted with prior rows + asins
   resetStore();
-  localStore.doneAsins = ['A'];
-  localStore.csvBatch = { fileName: 'reviews_prev.csv', rows: ['old:1'], asins: ['A', 'B', 'C'] };
-  T.resetState(); // reload doneAsins from the seeded storage (simulates panel reload)
+  localStore.doneAsinsImage = ['A'];
+  localStore.csvBatchImage = { fileName: 'reviews_images_prev.csv', rows: ['old:1'], asins: ['A', 'B', 'C'] };
+  T.resetState(); // reload done sets from the seeded storage (simulates panel reload)
   T.setProducts(P('A', 'B', 'C')); T.install({});
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
   eq(s.prepareCalls, ['B', 'C'], 'S3 A skipped (already done), only B,C prepared');
-  eq(s.fileName, 'reviews_prev.csv', 'S3 reuses same file on resume');
+  eq(s.fileName, 'reviews_images_prev.csv', 'S3 reuses same file on resume');
   eq(s.rows, ['old:1', 'r:B:0', 'r:C:0'], 'S3 appends to carried rows');
-  eq(localStore.doneAsins.sort(), ['A', 'B', 'C'], 'S3 B,C added to done');
+  eq(localStore.doneAsinsImage.sort(), ['A', 'B', 'C'], 'S3 B,C added to done');
 
   // S4 stop DURING selection (after 2 picks) -> no generation, nothing lost-marked
   resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({ stopAfterPick: 2 });
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
   eq(s.rows, [], 'S4 stop-in-selection: nothing generated');
-  ok(!localStore.doneAsins || localStore.doneAsins.length === 0, 'S4 nothing marked done');
+  ok(!localStore.doneAsinsImage || localStore.doneAsinsImage.length === 0, 'S4 nothing marked done');
 
   // S5 stop DURING generation (after 1) -> that one saved+done, rest not
   resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({ stopAfterGen: 1 });
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
   eq(s.rows, ['r:A:0'], 'S5 stop-in-gen: first product saved');
-  eq(localStore.doneAsins, ['A'], 'S5 only first marked done');
+  eq(localStore.doneAsinsImage, ['A'], 'S5 only first marked done');
   ok(saved.length >= 1, 'S5 file written with partial');
 
   // S6 new list (no overlap) after a persisted batch -> fresh file
   resetStore();
-  localStore.csvBatch = { fileName: 'reviews_old.csv', rows: ['x'], asins: ['A', 'B', 'C'] };
+  localStore.csvBatchImage = { fileName: 'reviews_images_old.csv', rows: ['x'], asins: ['A', 'B', 'C'] };
   T.resetState();
   T.setProducts(P('D', 'E')); T.install({});
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
-  ok(s.fileName !== 'reviews_old.csv', 'S6 new list -> fresh file, not old');
+  ok(s.fileName !== 'reviews_images_old.csv', 'S6 new list -> fresh file, not old');
   eq(s.rows, ['r:D:0', 'r:E:0'], 'S6 fresh rows (no carry from unrelated batch)');
 
   // S7 two consecutive skips keep prefetch aligned
   resetStore(); T.setProducts(P('A', 'B', 'C', 'D')); T.install({ prep: { B: { skip: true }, C: { skip: true } } });
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
   eq(s.prepareCalls, ['A', 'B', 'C', 'D'], 'S7 all prepared once despite 2 skips');
   eq(s.rows, ['r:A:0', 'r:D:0'], 'S7 only A and D generated');
 
   // S8 product that yields 0 reviews -> not marked done, counted as issue
   resetStore(); T.setProducts(P('A', 'B')); T.install({ gen: { B: { reviews: 0 } } });
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
   eq(s.rows, ['r:A:0'], 'S8 zero-review product adds no rows');
-  eq(localStore.doneAsins, ['A'], 'S8 zero-review product not marked done');
+  eq(localStore.doneAsinsImage, ['A'], 'S8 zero-review product not marked done');
 
   // S9 pick-persistence: stop after generating A (B,C picked+saved), then resume
   resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({ stopAfterGen: 1 });
-  await T.startProcessing();
-  ok((localStore.csvBatch.pending && localStore.csvBatch.pending.B && localStore.csvBatch.pending.C), 'S9 B,C selections persisted after stop');
-  ok(!localStore.csvBatch.pending.A, 'S9 generated A cleared from pending');
+  await T.startProcessing('image');
+  ok((localStore.csvBatchImage.pending && localStore.csvBatchImage.pending.B && localStore.csvBatchImage.pending.C), 'S9 B,C selections persisted after stop');
+  ok(!localStore.csvBatchImage.pending.A, 'S9 generated A cleared from pending');
   // resume with a fresh panel state + fresh mocks (prepareCalls reset)
   T.resetState(); T.setProducts(P('A', 'B', 'C')); T.install({});
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
   eq(s.prepareCalls, [], 'S9 resume re-scrapes NOTHING (A done, B,C restored)');
   eq(s.rows, ['r:A:0', 'r:B:0', 'r:C:0'], 'S9 resume generates restored B,C onto same file');
-  eq(localStore.doneAsins.sort(), ['A', 'B', 'C'], 'S9 all done after resume');
-  ok(!localStore.csvBatch.pending || Object.keys(localStore.csvBatch.pending).length === 0, 'S9 pending fully drained');
+  eq(localStore.doneAsinsImage.sort(), ['A', 'B', 'C'], 'S9 all done after resume');
+  ok(!localStore.csvBatchImage.pending || Object.keys(localStore.csvBatchImage.pending).length === 0, 'S9 pending fully drained');
 
   // S10 rerun of an ALL-already-done batch must NOT re-download the file
   resetStore(); T.setProducts(P('A', 'B')); T.install({});
-  await T.startProcessing();
+  await T.startProcessing('image');
   ok(saved.length >= 1, 'S10 first run writes the file');
-  ok(localStore.csvBatch.written === true, 'S10 batch flagged written after first run');
+  ok(localStore.csvBatchImage.written === true, 'S10 batch flagged written after first run');
   // rerun: fresh panel, same products (both already done), same persisted batch
   T.resetState(); saved.length = 0; T.setProducts(P('A', 'B')); T.install({});
-  await T.startProcessing();
+  await T.startProcessing('image');
   s = T.snap();
   eq(s.prepareCalls, [], 'S10 rerun processes nothing (all done)');
   eq(saved.length, 0, 'S10 rerun of all-done batch does NOT re-download the file');
 
-  // S11 output CSV is named after the uploaded file (cerave.txt -> cerave.csv)
+  // S11 output CSV is named after the uploaded file (cerave.txt -> cerave_images.csv)
   resetStore(); T.setFileBase('cerave'); T.setProducts(P('A')); T.install({});
-  await T.startProcessing();
-  eq(T.snap().fileName, 'cerave.csv', 'S11 fresh batch named after uploaded file');
-  ok(saved.length && saved[saved.length - 1].filename === 'cerave.csv', 'S11 downloaded as cerave.csv');
+  await T.startProcessing('image');
+  eq(T.snap().fileName, 'cerave_images.csv', 'S11 fresh batch named after uploaded file');
+  ok(saved.length && saved[saved.length - 1].filename === 'cerave_images.csv', 'S11 downloaded as cerave_images.csv');
   // resume the same batch but with a different upload name -> follows the new name
   T.resetState(); T.setFileBase('newname'); T.setProducts(P('A', 'B')); T.install({});
-  await T.startProcessing();
-  eq(T.snap().fileName, 'newname.csv', 'S11 resume follows the current uploaded file name');
+  await T.startProcessing('image');
+  eq(T.snap().fileName, 'newname_images.csv', 'S11 resume follows the current uploaded file name');
   T.setFileBase(''); // reset for any later scenarios
+
+  // S12 image mode, user picks NO photos for a product -> handled once, not looped
+  resetStore(); T.setProducts(P('A')); T.install({ pickEmpty: true });
+  await T.startProcessing('image');
+  s = T.snap();
+  eq(s.rows, [], 'S12 empty-pick product generates nothing');
+  eq(localStore.doneAsinsImage, ['A'], 'S12 intentional no-photo pick marked done (no infinite re-run)');
+  ok(!localStore.csvBatchImage.pending || !localStore.csvBatchImage.pending.A, 'S12 empty-pick pending cleared');
+
+  // ============================================================
+  // TEXT MODE (T1-T4) — fully automatic, NO image picking. Progress lives under
+  // doneAsins / csvBatch; the file has NO "_images" suffix.
+  // ============================================================
+  // T1 happy path: generates every product, never opens the picker
+  resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({});
+  await T.startProcessing('text');
+  s = T.snap();
+  eq(s.prepareCalls, ['A', 'B', 'C'], 'T1 every product looked up, in order');
+  eq(s.pickCount, 0, 'T1 text mode NEVER opens the image picker');
+  eq(s.rows, ['r:A:0', 'r:B:0', 'r:C:0'], 'T1 rows one per product');
+  eq(localStore.doneAsins.sort(), ['A', 'B', 'C'], 'T1 all marked done (text key)');
+  ok(!localStore.doneAsinsImage, 'T1 text run does NOT touch the image done-key');
+  ok(/^reviews_/.test(s.fileName) && !/_images/.test(s.fileName), 'T1 plain (non-image) filename');
+
+  // T2 skip a not-found product
+  resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({ prep: { B: { skip: true } } });
+  await T.startProcessing('text');
+  s = T.snap();
+  eq(s.rows, ['r:A:0', 'r:C:0'], 'T2 only A and C generated');
+  eq(localStore.doneAsins.sort(), ['A', 'C'], 'T2 skipped B not marked done');
+
+  // T3 resume: A already text-done, csvBatch carried
+  resetStore();
+  localStore.doneAsins = ['A'];
+  localStore.csvBatch = { fileName: 'cerave.csv', rows: ['old:1'], asins: ['A', 'B', 'C'] };
+  T.resetState();
+  T.setFileBase('cerave'); T.setProducts(P('A', 'B', 'C')); T.install({});
+  await T.startProcessing('text');
+  s = T.snap();
+  eq(s.prepareCalls, ['B', 'C'], 'T3 A skipped, only B,C looked up');
+  eq(s.fileName, 'cerave.csv', 'T3 reuses same text file on resume');
+  eq(s.rows, ['old:1', 'r:B:0', 'r:C:0'], 'T3 appends to carried rows');
+  T.setFileBase('');
+
+  // T4 stop DURING generation (after 1) -> first saved+done, rest not
+  resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({ stopAfterGen: 1 });
+  await T.startProcessing('text');
+  s = T.snap();
+  eq(s.rows, ['r:A:0'], 'T4 stop-in-gen: first product saved');
+  eq(localStore.doneAsins, ['A'], 'T4 only first marked done');
+
+  // ============================================================
+  // CROSS-MODE ISOLATION (X1) — a text run and an image run over the SAME list
+  // are independent: neither skips the other's ASINs, each writes its own file.
+  // ============================================================
+  resetStore(); T.setFileBase('cerave'); T.setProducts(P('A', 'B')); T.install({});
+  await T.startProcessing('text');
+  eq(localStore.doneAsins.sort(), ['A', 'B'], 'X1 text run marks the text done-key');
+  ok(!localStore.doneAsinsImage, 'X1 text run leaves the image done-key empty');
+  eq(T.snap().fileName, 'cerave.csv', 'X1 text file is cerave.csv');
+  // now the IMAGE run on the same list — must process A,B (not skip them) + own file
+  T.resetState(); T.setFileBase('cerave'); T.setProducts(P('A', 'B')); T.install({});
+  await T.startProcessing('image');
+  s = T.snap();
+  eq(s.prepareCalls, ['A', 'B'], 'X1 image run does NOT skip the text-done products');
+  eq(localStore.doneAsinsImage.sort(), ['A', 'B'], 'X1 image run marks the image done-key');
+  eq(s.fileName, 'cerave_images.csv', 'X1 image file is the separate cerave_images.csv');
+  ok(localStore.csvBatch && localStore.csvBatchImage, 'X1 both batches coexist in storage');
+  T.setFileBase('');
 
   // report
   console.log('\n============ ORCHESTRATION RESULTS ============');

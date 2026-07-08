@@ -11,7 +11,16 @@ let csvBatch = null;
 let lastFailed = []; // items that failed/were skipped in the last run (for Retry)
 let runSearchIds = []; // temp Lens SEARCH images uploaded this run (safe to delete)
 let runReviewIds = [];  // review PHOTOS re-hosted this run (IN USE by the CSV — deleting breaks reviews)
-let doneAsins = new Set(); // ASINs already completed (persisted) — skipped on re-run
+// Two independent run modes with SEPARATE progress + output files:
+//  - 'text'  → fully automatic, no image picking → "<name>.csv"
+//  - 'image' → interactive photo picking, one review per photo → "<name>_images.csv"
+// Each mode tracks its own done-ASINs and its own CSV batch so running one never
+// blocks or overwrites the other (you can do text now and images later).
+let runMode = 'text';
+let doneAsinsText = new Set();  // completed ASINs for the TEXT run (persisted)
+let doneAsinsImage = new Set(); // completed ASINs for the IMAGE run (persisted)
+let doneAsins = doneAsinsText;  // points at the ACTIVE mode's set during a run
+let lastMode = 'text';          // mode of the last run (used by Retry)
 let isProcessing = false;
 let isPaused = false;
 let geminiTabId = null;
@@ -194,7 +203,8 @@ const fileInfo = document.getElementById('fileInfo');
 const fileName = document.getElementById('fileName');
 const fileCount = document.getElementById('fileCount');
 const removeFile = document.getElementById('removeFile');
-const startBtn = document.getElementById('startBtn');
+const startTextBtn = document.getElementById('startTextBtn');
+const startImageBtn = document.getElementById('startImageBtn');
 const stopBtn = document.getElementById('stopBtn');
 const pauseBtn = document.getElementById('pauseBtn');
 const resumeBtn = document.getElementById('resumeBtn');
@@ -205,6 +215,7 @@ const useImagesBtn = document.getElementById('useImagesBtn');
 const skipImagesBtn = document.getElementById('skipImagesBtn');
 const clearLogBtn = document.getElementById('clearLogBtn');
 const retryBtn = document.getElementById('retryBtn');
+const addImagesBtn = document.getElementById('addImagesBtn');
 const clearImagesBtn = document.getElementById('clearImagesBtn');
 
 // Live run metrics
@@ -261,7 +272,8 @@ fileInput.addEventListener('change', (e) => {
   if (e.target.files.length) handleFile(e.target.files[0]);
 });
 removeFile.addEventListener('click', resetUpload);
-startBtn.addEventListener('click', startProcessing);
+startTextBtn.addEventListener('click', () => startProcessing('text'));
+startImageBtn.addEventListener('click', () => startProcessing('image'));
 
 stopBtn.addEventListener('click', () => {
   isProcessing = false;
@@ -315,7 +327,14 @@ clearImagesBtn.addEventListener('click', async () => {
 retryBtn.addEventListener('click', () => {
   if (lastFailed.length === 0) return;
   products = lastFailed.slice();
-  startProcessing();
+  startProcessing(lastMode); // retry in the same mode the failed run used
+});
+
+// After a TEXT run, do the image pass on the SAME list (no re-upload). Image
+// progress is tracked separately, so this processes every product afresh.
+addImagesBtn.addEventListener('click', () => {
+  if (!products.length) { alert('Upload the ASIN list again to add image reviews.'); return; }
+  startProcessing('image');
 });
 
 // Blocks while the run is paused (and still active), so processing halts at a
@@ -520,7 +539,8 @@ function finalizeUpload(file, parsedCount) {
   fileCount.textContent = dupes > 0 ? `${products.length} ASINs (${dupes} duplicate${dupes > 1 ? 's' : ''} removed)` : `${products.length} ASINs`;
   dropZone.classList.add('hidden');
   fileInfo.classList.remove('hidden');
-  startBtn.disabled = false;
+  startTextBtn.disabled = false;
+  startImageBtn.disabled = false;
 }
 
 function handleFile(file) {
@@ -564,7 +584,8 @@ function resetUpload() {
   fileInput.value = '';
   dropZone.classList.remove('hidden');
   fileInfo.classList.add('hidden');
-  startBtn.disabled = true;
+  startTextBtn.disabled = true;
+  startImageBtn.disabled = true;
 }
 
 function showStep(stepId) {
@@ -588,11 +609,15 @@ function log(message, type = 'info') {
 // MAIN PROCESSING
 // ============================================================
 
-async function startProcessing() {
+async function startProcessing(mode) {
   if (!products.length) {
     alert('No ASINs to process. Please upload a .txt list first.');
     return;
   }
+  // Select the run mode. Default 'text' (automatic, no image picking).
+  runMode = mode === 'image' ? 'image' : 'text';
+  lastMode = runMode;
+  doneAsins = runMode === 'image' ? doneAsinsImage : doneAsinsText;
   isProcessing = true;
   isPaused = false;
   showStep('step-processing');
@@ -609,7 +634,10 @@ async function startProcessing() {
   // resume of the same list, or a Retry of its failed items), keep appending to
   // the SAME file. A brand-new list starts a fresh file with a stable name
   // (persisted so future re-runs reuse it instead of creating a duplicate).
-  const persisted = await loadCsvBatch();
+  // Image runs write a SEPARATE file (<name>_images.csv) and keep a SEPARATE
+  // batch in storage, so the text CSV and image CSV never overwrite each other.
+  const suffix = runMode === 'image' ? '_images' : '';
+  const persisted = await loadCsvBatch(); // reads the active mode's batch key
   const inSameBatch = persisted && persisted.fileName && Array.isArray(persisted.rows)
     && Array.isArray(persisted.asins) && products.some((p) => persisted.asins.includes(p.asin));
   if (inSameBatch) {
@@ -617,14 +645,15 @@ async function startProcessing() {
   } else {
     const dateStr = new Date().toISOString().slice(0, 10);
     // Name the CSV after the uploaded file (falls back to a dated name).
-    const fname = uploadedFileBase ? `${uploadedFileBase}.csv` : `reviews_${dateStr}_${Date.now()}.csv`;
+    const fname = uploadedFileBase ? `${uploadedFileBase}${suffix}.csv` : `reviews${suffix}_${dateStr}_${Date.now()}.csv`;
     csvBatch = { fileName: fname, rows: [], asins: products.map((p) => p.asin) };
   }
   // Always name the output after the CURRENT uploaded file (e.g. cerave.txt ->
-  // cerave.csv), even when resuming an existing batch. If the name changes, the
+  // cerave.csv / cerave_images.csv), even when resuming. If the name changes, the
   // file must be (re)written under the new name.
-  if (uploadedFileBase && csvBatch.fileName !== `${uploadedFileBase}.csv`) {
-    csvBatch.fileName = `${uploadedFileBase}.csv`;
+  const wantName = uploadedFileBase ? `${uploadedFileBase}${suffix}.csv` : csvBatch.fileName;
+  if (uploadedFileBase && csvBatch.fileName !== wantName) {
+    csvBatch.fileName = wantName;
     csvBatch.written = false;
   }
   // Persisted image selections (by ASIN), so a Stop/close during selection or
@@ -652,14 +681,77 @@ async function startProcessing() {
     }
   }
 
+  const setStepTitle = (t) => { const el = document.getElementById('stepTitle'); if (el) el.textContent = t; };
+
+  // ============================================================
+  // TEXT MODE — fully automatic. No image picking: look up each product on
+  // dropy (lightweight, no image search) and generate text-only reviews,
+  // streaming them into "<name>.csv". Unattended — the user can step away.
+  // ============================================================
+  if (runMode === 'text') {
+    setStepTitle('Generating text reviews · automatic');
+    if (todo.length && isProcessing) {
+      log(`Generating text reviews for ${todo.length} product(s) — no image selection needed. You can step away.`, 'success');
+    }
+    for (let k = 0; k < todo.length; k++) {
+      await waitWhilePaused();
+      if (!isProcessing) { log('Stopped', 'warn'); break; }
+
+      const { item, i } = todo[k];
+      updateOverallProgress(k + 1, todo.length);
+      updateAsinRow(i, 'processing', null, 'looking up...');
+      updateProductStatus('Finding product on dropy.in...', item.asin);
+      log(`Text ${k + 1}/${todo.length}: ${item.asin}`, 'info');
+
+      let data;
+      try {
+        data = await prepareProduct(item, i, true); // textOnly — skip all image search
+      } catch (e) {
+        data = { skip: true, error: e.message };
+      }
+
+      if (!data || data.skip) {
+        const err = (data && data.error) || 'not found on dropy.in';
+        log(`Skipped ${item.asin}: ${err}`, 'error');
+        updateAsinRow(i, 'skipped', item.asin, err);
+        results.push({ asin: item.asin, sku: item.sku, name: item.asin, reviews: 0, images: 0, error: err });
+        stats.done++; stats.issues++;
+        renderMetrics();
+        continue;
+      }
+
+      updateAsinRow(i, 'processing', data.productData.name, 'generating...');
+      let result;
+      try {
+        result = await generateProduct({ item, i, productData: data.productData, selected: [], mode: 'text' });
+      } catch (err) {
+        log(`Error generating ${item.asin}: ${err.message}`, 'error');
+        result = { asin: item.asin, sku: item.sku, name: data.productData.name || 'Error', reviews: 0, images: 0, error: err.message };
+      }
+      results.push(result);
+      updateAsinRow(i, classifyResult(result), result.name, `${result.reviews || 0} rev`);
+
+      // Persist rows + mark done as each product finishes (crash-safe resume).
+      if ((result.reviews || 0) > 0) {
+        csvBatch.written = false;
+        const persistedOk = await saveCsvBatch();
+        if (persistedOk) markDone(item.asin);
+      }
+
+      stats.done++;
+      stats.reviews += (result.reviews || 0);
+      if (result.error || (result.reviews || 0) === 0) stats.issues++;
+      renderMetrics();
+
+      if (k < todo.length - 1 && isProcessing) await sleep(800);
+    }
+  } else {
   // ============================================================
   // PHASE 1 — SELECTION (interactive). Pick images for every product
   // back-to-back. While you pick one product, the NEXT is already being scraped
   // in the background (1-ahead look-ahead) so its picker opens with no wait.
   // Text generation is deferred to Phase 2 — you never wait on Gemini here.
   // ============================================================
-  const setStepTitle = (t) => { const el = document.getElementById('stepTitle'); if (el) el.textContent = t; };
-
   setStepTitle('Step 1 of 2 · Select Images');
   const prepared = []; // { item, i, productData, selected } → generated in Phase 2
   let prefetch = null; // { k, promise } — the next product being scraped ahead
@@ -755,6 +847,7 @@ async function startProcessing() {
     if (!isProcessing) { log('Stopped during generation', 'warn'); break; }
 
     const job = prepared[j];
+    job.mode = 'image'; // one review per selected photo, all carrying a photo
     updateOverallProgress(j + 1, prepared.length);
     updateAsinRow(job.i, 'processing', job.productData.name, 'generating...');
     log(`Generating ${j + 1}/${prepared.length}: ${job.productData.name}`, 'info');
@@ -779,6 +872,14 @@ async function startProcessing() {
       delete csvBatch.pending[job.item.asin]; // selection consumed — no longer needed
       const persisted = await saveCsvBatch();
       if (persisted) markDone(job.item.asin);
+    } else if ((job.selected || []).length === 0) {
+      // User deliberately picked NO photos for this product → record it as handled
+      // so it isn't re-scraped/re-prompted (and doesn't loop generating 0 reviews)
+      // on every resume. Genuine generation failures (selected>0, reviews=0) keep
+      // their pending so Retry/resume can try again.
+      delete csvBatch.pending[job.item.asin];
+      const persisted = await saveCsvBatch();
+      if (persisted) markDone(job.item.asin);
     }
 
     stats.done++;
@@ -789,6 +890,7 @@ async function startProcessing() {
 
     if (j < prepared.length - 1 && isProcessing) await sleep(800);
   }
+  } // end image mode
 
   // Write/overwrite the ONE combined CSV for this batch — same file across
   // Stop→Continue/resume (overwrite, never "reviews (1).csv"). Only (re)download
@@ -849,7 +951,7 @@ async function recoverGemini() {
 // candidates. No text generation and no user interaction, so it is safe to run
 // AHEAD of time (prefetch) while the user picks the previous product's images.
 // Returns { productData, candidates, refImg, refFull } or { skip:true, error }.
-async function prepareProduct(item, productIndex) {
+async function prepareProduct(item, productIndex, textOnly = false) {
   const asin = item.asin;
   const sku = item.sku;
 
@@ -880,6 +982,14 @@ async function prepareProduct(item, productIndex) {
       return { skip: true, error: `dropy result doesn't match ASIN ${asin} (possible wrong product)` };
     }
     log(`⚠ Couldn't confirm "${productName}" matches ${asin} — check the reference image is the right product`, 'warn');
+  }
+
+  // TEXT MODE fast path: reviews carry no photos, so skip ALL image search
+  // (Lens/Google/Pinterest/Amazon/Bing/social) entirely. Just return the scraped
+  // product data — the run goes straight to generating text reviews.
+  if (textOnly) {
+    productData.lensText = '';
+    return { productData, candidates: [], refImg: '', refFull: '' };
   }
 
   // Step 2: gather REAL user photos from several sources. Each result item is
@@ -1060,6 +1170,7 @@ async function prepareProduct(item, productIndex) {
 // unattended after all selections are done. job = { item, productData, selected }.
 async function generateProduct(job) {
   const { item, productData, selected } = job;
+  const isImageMode = job.mode === 'image';
   const asin = item.asin;
   const sku = item.sku;
   const productName = productData.name;
@@ -1153,9 +1264,20 @@ async function generateProduct(job) {
     await sleep(2000);
   }
 
-  // Step 4: Generate reviews in batches (count + batch size from Settings)
+  // Step 4: Generate reviews in batches (count + batch size from Settings).
+  // IMAGE mode: exactly one review per hosted photo, every review carries a
+  // photo. TEXT mode: a random count between the configured min/max, no photos.
   const rMin = settings.min || 25, rMax = settings.max || 100;
-  const totalReviews = Math.floor(Math.random() * (Math.max(rMin, rMax) - rMin + 1)) + rMin;
+  let totalReviews;
+  if (isImageMode) {
+    totalReviews = (productData.photoItems || []).length;
+    if (!totalReviews) {
+      log('No photos picked for this product — skipped in image mode (nothing to add to the images CSV)', 'warn');
+      return { asin, sku, name: productName, reviews: 0, images: 0, error: 'no images picked (skipped)' };
+    }
+  } else {
+    totalReviews = Math.floor(Math.random() * (Math.max(rMin, rMax) - rMin + 1)) + rMin;
+  }
   const batchSize = settings.batch || 10;
   const totalBatches = Math.ceil(totalReviews / batchSize);
   let allReviews = [];
@@ -1624,7 +1746,8 @@ function classifyResult(r) {
   if (r.alreadyDone) return 'done';
   if ((r.reviews || 0) > 0) return 'done';
   const e = (r.error || '').toLowerCase();
-  if (e.includes('not found') || e.includes('dropy') || e.includes('stopped') || e.includes('blocked')) return 'skipped';
+  if (e.includes('not found') || e.includes('dropy') || e.includes('stopped') || e.includes('blocked')
+      || e.includes('no images') || e.includes('skipped')) return 'skipped';
   return 'error';
 }
 
@@ -1672,6 +1795,14 @@ function showResults(results) {
     clearImagesBtn.textContent = `🗑 Delete this run's ${runReviewIds.length} review photo(s) (⚠ only if not imported)`;
   } else {
     clearImagesBtn.classList.add('hidden');
+  }
+
+  // After a text run, offer a one-click image pass on the same list (image
+  // progress is separate, so it won't be skipped as "already done").
+  if (lastMode === 'text' && products.length) {
+    addImagesBtn.classList.remove('hidden');
+  } else {
+    addImagesBtn.classList.add('hidden');
   }
 
   // Retry: only products that produced no reviews and weren't already done
@@ -1911,32 +2042,44 @@ async function deleteReviewImages() {
   alert(`Deleted ${res.deleted || 0} review photo(s).`);
 }
 
+// Storage keys are namespaced by run mode so the text run and image run keep
+// SEPARATE progress + batches (text uses the original keys for back-compat).
+function doneStoreKey() { return runMode === 'image' ? 'doneAsinsImage' : 'doneAsins'; }
+function csvStoreKey() { return runMode === 'image' ? 'csvBatchImage' : 'csvBatch'; }
+
 // --- Progress: completed ASINs persisted across runs (resume, don't restart) ---
 function loadProgress() {
   try {
-    chrome.storage.local.get(['doneAsins'], (r) => {
-      doneAsins = new Set((r && r.doneAsins) || []);
+    chrome.storage.local.get(['doneAsins', 'doneAsinsImage'], (r) => {
+      doneAsinsText = new Set((r && r.doneAsins) || []);
+      doneAsinsImage = new Set((r && r.doneAsinsImage) || []);
+      doneAsins = runMode === 'image' ? doneAsinsImage : doneAsinsText;
       updateProgressUi();
     });
   } catch (e) {}
 }
 function saveProgress() {
-  try { chrome.storage.local.set({ doneAsins: Array.from(doneAsins) }); } catch (e) {}
+  try { chrome.storage.local.set({ [doneStoreKey()]: Array.from(doneAsins) }); } catch (e) {}
 }
 function markDone(asin) {
   if (asin && !doneAsins.has(asin)) { doneAsins.add(asin); saveProgress(); updateProgressUi(); }
 }
 function resetProgress() {
-  doneAsins = new Set();
-  saveProgress();
-  clearCsvBatch(); // forgetting progress starts a brand-new CSV file next run
+  // Forget progress for BOTH modes and drop both batch files.
+  doneAsinsText = new Set();
+  doneAsinsImage = new Set();
+  doneAsins = runMode === 'image' ? doneAsinsImage : doneAsinsText;
+  try { chrome.storage.local.set({ doneAsins: [], doneAsinsImage: [] }); } catch (e) {}
+  csvBatch = null;
+  try { chrome.storage.local.remove(['csvBatch', 'csvBatchImage']); } catch (e) {}
   updateProgressUi();
 }
 
 // --- Combined CSV batch: persisted so Stop→Continue/resume keeps ONE file ---
 function loadCsvBatch() {
+  const key = csvStoreKey();
   return new Promise((resolve) => {
-    try { chrome.storage.local.get(['csvBatch'], (r) => resolve((r && r.csvBatch) || null)); }
+    try { chrome.storage.local.get([key], (r) => resolve((r && r[key]) || null)); }
     catch (e) { resolve(null); }
   });
 }
@@ -1944,18 +2087,20 @@ function loadCsvBatch() {
 // Returns false if the write failed (e.g. storage quota) so callers can avoid
 // marking an ASIN "done" when its reviews weren't actually saved.
 function saveCsvBatch() {
+  const key = csvStoreKey();
   return new Promise((resolve) => {
-    try { chrome.storage.local.set({ csvBatch }, () => resolve(!chrome.runtime.lastError)); }
+    try { chrome.storage.local.set({ [key]: csvBatch }, () => resolve(!chrome.runtime.lastError)); }
     catch (e) { resolve(false); }
   });
 }
-function clearCsvBatch() {
-  csvBatch = null;
-  try { chrome.storage.local.remove('csvBatch'); } catch (e) {}
-}
 function updateProgressUi() {
   const el = document.getElementById('progressInfo');
-  if (el) el.textContent = doneAsins.size ? `${doneAsins.size} ASIN(s) marked done (skipped on re-run)` : 'No completed ASINs yet.';
+  if (!el) return;
+  const t = doneAsinsText.size, im = doneAsinsImage.size;
+  const parts = [];
+  if (t) parts.push(`${t} text`);
+  if (im) parts.push(`${im} image`);
+  el.textContent = parts.length ? `${parts.join(' + ')} ASIN(s) marked done (skipped on re-run)` : 'No completed ASINs yet.';
 }
 
 function initDashboard() {

@@ -307,6 +307,10 @@ code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px;
 }
 
 .btn-secondary:hover { background: rgba(99,102,241,0.25); }
+.btn-secondary:disabled { opacity: .5; cursor: not-allowed; }
+
+.start-actions { display: flex; flex-direction: column; gap: 10px; }
+.start-hint { margin-top: 10px; }
 
 .btn-resume {
   width: 100%;
