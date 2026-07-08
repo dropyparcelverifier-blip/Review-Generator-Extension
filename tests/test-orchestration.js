@@ -235,6 +235,7 @@ async function run() {
   eq(s.prepareCalls, ['A', 'B', 'C'], 'T1 every product looked up, in order');
   eq(s.pickCount, 0, 'T1 text mode NEVER opens the image picker');
   eq(s.rows, ['r:A:0', 'r:B:0', 'r:C:0'], 'T1 rows one per product');
+  ok(saved.length >= 3, 'T1 CSV flushed to disk per product (crash-proof, >=3 writes)');
   eq(localStore.doneAsins.sort(), ['A', 'B', 'C'], 'T1 all marked done (text key)');
   ok(!localStore.doneAsinsImage, 'T1 text run does NOT touch the image done-key');
   ok(/^reviews_/.test(s.fileName) && !/_images/.test(s.fileName), 'T1 plain (non-image) filename');

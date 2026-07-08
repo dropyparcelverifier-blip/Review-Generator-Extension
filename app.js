@@ -731,11 +731,14 @@ async function startProcessing(mode) {
       results.push(result);
       updateAsinRow(i, classifyResult(result), result.name, `${result.reviews || 0} rev`);
 
-      // Persist rows + mark done as each product finishes (crash-safe resume).
+      // Persist rows + mark done as each product finishes (crash-safe resume) AND
+      // write the CSV to disk now (crash-proof the file itself, no resume needed).
       if ((result.reviews || 0) > 0) {
-        csvBatch.written = false;
+        csvBatch.written = false;         // new rows not on disk yet
         const persistedOk = await saveCsvBatch();
         if (persistedOk) markDone(item.asin);
+        flushCsvToDisk();                 // overwrite <name>.csv on disk now
+        await saveCsvBatch();             // remember written=true
       }
 
       stats.done++;
@@ -868,10 +871,12 @@ async function startProcessing(mode) {
     // (the file is rewritten from these rows below and on any resume). Only mark
     // done if the persist actually succeeded — never skip unsaved reviews.
     if ((result.reviews || 0) > 0) {
-      csvBatch.written = false; // new rows -> the file needs (re)writing at run end
+      csvBatch.written = false; // new rows not on disk yet
       delete csvBatch.pending[job.item.asin]; // selection consumed — no longer needed
       const persisted = await saveCsvBatch();
       if (persisted) markDone(job.item.asin);
+      flushCsvToDisk();          // crash-proof: write <name>_images.csv to disk now
+      await saveCsvBatch();      // remember written=true
     } else if ((job.selected || []).length === 0) {
       // User deliberately picked NO photos for this product → record it as handled
       // so it isn't re-scraped/re-prompted (and doesn't loop generating 0 reviews)
@@ -897,6 +902,8 @@ async function startProcessing(mode) {
   // when this run actually ADDED rows, or the file was never written for this
   // batch (e.g. a prior run crashed before writing). A plain rerun of an
   // all-already-done batch adds nothing, so it must NOT re-download the old file.
+  // The file is already streamed to disk after each product (flushCsvToDisk), so
+  // this is a safety net: only (re)write if a per-product flush didn't land.
   const addedThisRun = csvBatch.rows.length - rowsBefore;
   if (csvBatch.rows.length && !csvBatch.written) {
     writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
@@ -904,7 +911,10 @@ async function startProcessing(mode) {
     await saveCsvBatch();
     log(`✅ ${csvBatch.fileName} saved — ${addedThisRun} new this run, ${csvBatch.rows.length} reviews total in the file`, 'success');
   } else if (csvBatch.rows.length) {
-    log(`No new reviews this run — ${csvBatch.fileName} already saved (not re-downloaded)`, 'info');
+    const msg = addedThisRun > 0
+      ? `✅ ${csvBatch.fileName} — ${addedThisRun} new this run, ${csvBatch.rows.length} total (written to disk as it ran)`
+      : `No new reviews this run — ${csvBatch.fileName} already saved (not re-downloaded)`;
+    log(msg, addedThisRun > 0 ? 'success' : 'info');
   }
 
   // Auto-delete the run's temporary Lens search images (disposable, never in the CSV).
@@ -1689,6 +1699,18 @@ function writeCombinedCsv(rows, fileName) {
   } catch (e) {
     downloadCsvFallback(csv, fileName);
   }
+}
+
+// Crash-proofing: (over)write the batch's CSV to disk RIGHT NOW, as each product
+// finishes — not just at run end. So if an unattended run loses power (or the tab
+// closes) mid-batch, a complete file with everything done-so-far is already on
+// disk, no resume run needed. Uses the same overwrite+stable-name so it stays ONE
+// file. `written` is only set true AFTER the file is actually sent, so storage
+// never claims "on disk" when it isn't.
+function flushCsvToDisk() {
+  if (!csvBatch || !csvBatch.rows.length) return;
+  writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
+  csvBatch.written = true;
 }
 
 function downloadCsvFallback(csv, fileName) {
