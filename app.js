@@ -721,7 +721,8 @@ async function startProcessing(mode) {
         continue;
       }
 
-      updateAsinRow(i, 'processing', data.productData.name, 'generating...');
+      const unverified = data.productData.asinVerified === false;
+      updateAsinRow(i, 'processing', data.productData.name, unverified ? '⚠ unverified — generating' : 'generating...');
       let result;
       try {
         result = await generateProduct({ item, i, productData: data.productData, selected: [], mode: 'text' });
@@ -729,8 +730,9 @@ async function startProcessing(mode) {
         log(`Error generating ${item.asin}: ${err.message}`, 'error');
         result = { asin: item.asin, sku: item.sku, name: data.productData.name || 'Error', reviews: 0, images: 0, error: err.message };
       }
+      if (unverified) result.unverified = true; // surfaced in results so it isn't missed
       results.push(result);
-      updateAsinRow(i, classifyResult(result), result.name, `${result.reviews || 0} rev`);
+      updateAsinRow(i, classifyResult(result), result.name, `${result.reviews || 0} rev${unverified ? ' · ⚠ unverified' : ''}`);
 
       // Persist rows + mark done as each product finishes (crash-safe resume) AND
       // write the CSV to disk now (crash-proof the file itself, no resume needed).
@@ -1794,6 +1796,13 @@ function classifyResult(r) {
 
 function showResults(results) {
   showStep('step-complete');
+
+  // Loudly flag any product that generated reviews but whose dropy match couldn't
+  // be ASIN-verified — easy to miss in an unattended text run's log.
+  const unverified = results.filter(r => r.unverified && (r.reviews || 0) > 0);
+  if (unverified.length) {
+    log(`⚠ ${unverified.length} product(s) generated reviews but couldn't be ASIN-verified — double-check: ${unverified.map(r => r.asin).join(', ')}. Turn on Settings → "Skip unconfirmed matches" to auto-skip these next time.`, 'warn');
+  }
 
   const doneCount = results.filter(r => (r.reviews || 0) > 0 || r.alreadyDone).length;
   const totalReviews = results.reduce((s, r) => s + (r.reviews || 0), 0);
