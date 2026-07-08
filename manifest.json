@@ -24,7 +24,9 @@
     "https://www.flipkart.com/*",
     "https://*.myshopify.com/*",
     "https://shopify-staged-uploads.storage.googleapis.com/*",
-    "https://*.storage.googleapis.com/*"
+    "https://*.storage.googleapis.com/*",
+    "https://*/*",
+    "http://*/*"
   ],
   "background": {
     "service_worker": "background.js"
