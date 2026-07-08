@@ -83,7 +83,14 @@ Both: 1) upload `.txt/.csv/.xlsx` → `extractAsin` → `products`; 4) **one CSV
   and flag it in the picker/row.
 - **Cloudflare detection:** dropy search/product pages return a "blocked" signal (vs
   "not found") so the UI can say "pass the check, then retry".
-- **Image quality:** real review photos are uploaded as raw source bytes (no
+- **Image hosting (Shopify Files):** external candidate photos are hosted by handing
+  Shopify the SOURCE URL (`hostShopifyFileByUrl` → `fileCreate originalSource=<url>`),
+  so Shopify's servers fetch the image — **no byte download in the extension, so no
+  CORS.** Only captured `dataUrl` images (canvas/Lens) go through the staged byte upload
+  (`uploadToShopifyFiles`). If Shopify can't fetch a URL (hotlink-protected), it falls
+  back to an in-extension `fetch` (needs `<all_urls>` host perm) and, failing that, uses
+  the source URL as-is (`fetchFails` is reported to the UI).
+- **Image quality:** real review photos are hosted from their raw source (no
   recompression). Canvas capture (`toDataUrl`/`padToSquare`, JPEG ~0.95, ≤2400px) is
   used only for the Lens *search* image and the no-real-photos fallback.
 - **Image relevance:** whole-word token matching against brand/name (+ unique

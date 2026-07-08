@@ -102,6 +102,34 @@ async function uploadToShopifyFiles(blob, filename) {
   return { url, id: file.id };
 }
 
+// Hosts an image on Shopify Files by handing Shopify the SOURCE URL and letting
+// Shopify's servers fetch it (fileCreate originalSource = public URL). No byte
+// download in the extension, so NO CORS — works even without host permissions.
+// Returns { url, id }. Throws if Shopify can't create/fetch the file.
+async function hostShopifyFileByUrl(sourceUrl) {
+  const createQ = `mutation($files:[FileCreateInput!]!){fileCreate(files:$files){files{id fileStatus alt preview{image{url}} ... on MediaImage{image{url}}} userErrors{field message}}}`;
+  const created = await shopifyGraphql(createQ, { files: [{ originalSource: sourceUrl, contentType: 'IMAGE' }] });
+  const file = created && created.data && created.data.fileCreate && created.data.fileCreate.files && created.data.fileCreate.files[0];
+  if (!file) {
+    const errs = (created && created.data && created.data.fileCreate && created.data.fileCreate.userErrors) || (created && created.errors) || 'unknown';
+    throw new Error('fileCreate(url): ' + JSON.stringify(errs));
+  }
+  // Poll until the CDN URL is ready — Shopify fetches + processes asynchronously.
+  let url = (file.image && file.image.url) || (file.preview && file.preview.image && file.preview.image.url) || '';
+  const nodeQ = `query($id:ID!){node(id:$id){... on MediaImage{fileStatus image{url} preview{image{url}}}}}`;
+  for (let i = 0; i < 15 && !url; i++) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const q = await shopifyGraphql(nodeQ, { id: file.id });
+    const node = q && q.data && q.data.node;
+    if (node) {
+      url = (node.image && node.image.url) || (node.preview && node.preview.image && node.preview.image.url) || '';
+      if (node.fileStatus === 'FAILED') throw new Error('Shopify could not fetch the source image');
+    }
+  }
+  if (!url) throw new Error('Shopify file URL not ready (still processing)');
+  return { url, id: file.id };
+}
+
 // Deletes Shopify Files by their GIDs.
 async function deleteShopifyFiles(fileIds) {
   const ids = (fileIds || []).filter(Boolean);
@@ -753,21 +781,31 @@ async function uploadReviewImages(sku, images) {
     let fetchFails = 0; // images whose bytes couldn't be fetched (usually CORS/host perm)
     for (let n = 0; n < items.length; n++) {
       const it = items[n];
+      const name = `review-${sku}-${n + 1}.jpg`;
       try {
-        let blob = null;
-        if (it.dataUrl) blob = dataUrlToBlob(it.dataUrl);
-        else if (it.url) {
-          const resp = await fetch(it.url);
-          if (!resp.ok) throw new Error('HTTP ' + resp.status);
-          blob = await resp.blob();
+        let u = null;
+        if (it.dataUrl) {
+          // Captured bytes (data URL, e.g. canvas/Lens image) — staged byte upload.
+          u = await uploadToShopifyFiles(dataUrlToBlob(it.dataUrl), name);
+        } else if (it.url) {
+          // PREFER Shopify server-side fetch by URL — no byte download, no CORS.
+          try {
+            u = await hostShopifyFileByUrl(it.url);
+          } catch (e1) {
+            // Shopify couldn't fetch it (e.g. hotlink-blocked). Fall back to
+            // downloading the bytes ourselves, then staged upload (needs host perm).
+            try {
+              const resp = await fetch(it.url);
+              if (!resp.ok) throw new Error('HTTP ' + resp.status);
+              u = await uploadToShopifyFiles(await resp.blob(), name);
+            } catch (e2) {
+              fetchFails++; // neither Shopify nor we could fetch the image
+            }
+          }
         }
-        if (!blob) { urls.push(it.url || ''); fileIds.push(''); continue; }
-        const u = await uploadToShopifyFiles(blob, `review-${sku}-${n + 1}.jpg`);
-        urls.push((u && u.url) || it.url || '');
-        fileIds.push((u && u.id) || '');
-        if (u && u.url) okCount++;
+        if (u && u.url) { urls.push(u.url); fileIds.push(u.id || ''); okCount++; }
+        else { urls.push(it.url || ''); fileIds.push(''); }
       } catch (e) {
-        if (it.url && !it.dataUrl) fetchFails++; // couldn't fetch the source bytes
         urls.push(it.url || ''); fileIds.push('');
       }
     }
