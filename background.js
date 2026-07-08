@@ -963,6 +963,25 @@ function scrapeAmazonAcrossDomains(asin, domains, sendResponse) {
   tryNext();
 }
 
+// MV3 service workers get torn down when idle — including DURING a long await like a
+// Gemini generation (30s+), an AI-overview scrape, or an image upload — which drops
+// the pending sendResponse ("A listener indicated an asynchronous response ... but the
+// message channel closed" warning, and a lost/failed batch). While any long op is in
+// flight, ping a cheap chrome API every 20s (< the ~30s idle limit) to reset the timer.
+// Ref-counted so overlapping ops share one timer; self-arms per op so it survives a SW
+// restart mid-run.
+let keepAliveRefs = 0;
+let keepAliveTimer = null;
+function keepAlive(on) {
+  if (on) {
+    keepAliveRefs++;
+    if (!keepAliveTimer) keepAliveTimer = setInterval(() => { try { chrome.runtime.getPlatformInfo(() => {}); } catch (e) {} }, 20000);
+  } else if (keepAliveRefs > 0) {
+    keepAliveRefs--;
+    if (keepAliveRefs === 0 && keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'save_file') {
     // Silent save — no "Save As" dialog, auto-rename on conflict.
@@ -1108,17 +1127,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === 'ai_overview') {
     (async () => {
-      const url = `https://www.google.com/search?q=${encodeURIComponent(msg.query)}`;
-      const text = await runInTab(url, scrapeAiOverview, { settle: 3000 });
-      sendResponse({ text: text || '' });
+      keepAlive(true);
+      try {
+        const url = `https://www.google.com/search?q=${encodeURIComponent(msg.query)}`;
+        const text = await runInTab(url, scrapeAiOverview, { settle: 3000 });
+        sendResponse({ text: text || '' });
+      } catch (e) {
+        sendResponse({ text: '' });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
 
   if (msg.action === 'upload_images') {
     (async () => {
-      const result = await uploadReviewImages(msg.sku, msg.images || []);
-      sendResponse(result);
+      keepAlive(true);
+      try {
+        const result = await uploadReviewImages(msg.sku, msg.images || []);
+        sendResponse(result);
+      } catch (e) {
+        // Always answer so the channel never closes silently; fall back to source URLs.
+        const urls = (msg.images || []).map((x) => (typeof x === 'string' ? x : (x && x.url)) || '');
+        sendResponse({ ok: false, configured: true, error: e.message, urls, fileIds: [] });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
@@ -1201,11 +1232,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'send_to_gemini') {
+    keepAlive(true); // Gemini generation is long — keep the SW alive until it replies
     chrome.tabs.sendMessage(msg.tabId, {
       action: 'inject_prompt',
       prompt: msg.prompt
     }, (response) => {
-      sendResponse(response || { error: 'No response from Gemini' });
+      keepAlive(false);
+      sendResponse(response || { error: chrome.runtime.lastError?.message || 'No response from Gemini' });
     });
     return true;
   }
