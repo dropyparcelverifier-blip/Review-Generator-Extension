@@ -49,6 +49,12 @@ its own progress + output file (run text now, images later — order doesn't mat
 Both: 1) upload `.txt/.csv/.xlsx` → `extractAsin` → `products`; 4) **one CSV per batch**,
 `conflictAction:'overwrite'` + stable filename so Stop→resume keeps the SAME file.
 
+**CSV format = Judge.me import** (`CSV_HEADERS`/`buildCsvRows`): `title, body, rating,
+review_date, reviewer_name, reviewer_email, product_url, picture_urls, product_id,
+product_handle`. `reviewer_email` is synthesized from the name; `product_id` (strongest
+match key), `product_handle`, and `product_url` come from the store's Shopify product
+JSON fetched by the dropy handle in `dropy_lookup` (the store reuses dropy's handles).
+
 ## Persistence (`chrome.storage.local`) — **namespaced by mode**
 - `doneAsins` (text) / `doneAsinsImage` (image) — completed ASINs per mode, skipped on
   re-run. Separate so a text run never makes the image run skip that ASIN (or vice-versa).

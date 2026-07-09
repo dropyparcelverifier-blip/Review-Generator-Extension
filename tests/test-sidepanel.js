@@ -243,34 +243,44 @@ function firstReview(json) { const r = G.parseGeminiResponse(json); return r; }
     date: '2025-01-01', has_photo: false, reviewer_gender: 'male'
   }, over);
 
-  // no images -> empty picture col, correct count
-  let rows = G.buildCsvRows([rev(), rev()], 'Dropy-X', []);
-  eq(rows.length, 2, 'buildCsvRows count');
-  eq(rows[0].split(',').length, 7, 'buildCsvRows 7 columns');
-  ok(rows.every(r => r.endsWith(',')), 'buildCsvRows empty picture col when no images');
+  // Judge.me match keys passed as a product object.
+  const P = { productHandle: 'amika-x', productId: '7380000000001', storeProductUrl: 'https://s.myshopify.com/products/amika-x' };
+  // columns: title,body,rating,review_date,reviewer_name,reviewer_email,product_url,picture_urls,product_id,product_handle
 
-  // gender match: female image -> female has_photo review
+  // no images -> empty picture col, 10-column Judge.me format
+  let rows = G.buildCsvRows([rev(), rev()], P, []);
+  eq(rows.length, 2, 'buildCsvRows count');
+  let cols = rows[0].split(',');
+  eq(cols.length, 10, 'buildCsvRows 10 columns (Judge.me)');
+  eq(cols[5], 'n@customer.review', 'reviewer_email generated from name');
+  eq(cols[6], 'https://s.myshopify.com/products/amika-x', 'product_url column');
+  eq(cols[7], '', 'picture_urls empty when no images');
+  eq(cols[8], '7380000000001', 'product_id column');
+  eq(cols[9], 'amika-x', 'product_handle column');
+
+  // gender match: female image -> female has_photo review (picture is col index 7)
   const reviews = [rev({ has_photo: true, reviewer_gender: 'male', reviewer_name: 'M' }),
                    rev({ has_photo: true, reviewer_gender: 'female', reviewer_name: 'F' }),
                    rev({ has_photo: false, reviewer_gender: 'male', reviewer_name: 'X' })];
-  rows = G.buildCsvRows(reviews, 'Dropy-X', [{ url: 'https://img/f.jpg', persona: 'female' }]);
-  ok(rows[1].includes('https://img/f.jpg'), 'female image -> female reviewer row');
-  ok(!rows[0].includes('https://img/f.jpg') && !rows[2].includes('https://img/f.jpg'), 'image only on the matched row');
+  rows = G.buildCsvRows(reviews, P, [{ url: 'https://img/f.jpg', persona: 'female' }]);
+  eq(rows[1].split(',')[7], 'https://img/f.jpg', 'female image -> female reviewer picture col');
+  ok(rows[0].split(',')[7] === '' && rows[2].split(',')[7] === '', 'image only on the matched row');
 
   // more images than photo-reviews -> falls back to any review, no crash, each url placed once
   rows = G.buildCsvRows([rev({ has_photo: true, reviewer_gender: 'male' }), rev({ has_photo: false })],
-    'Dropy-X', [{ url: 'a.jpg', persona: 'male' }, { url: 'b.jpg', persona: 'female' }, { url: 'c.jpg', persona: 'neutral' }]);
+    P, [{ url: 'a.jpg', persona: 'male' }, { url: 'b.jpg', persona: 'female' }, { url: 'c.jpg', persona: 'neutral' }]);
   const joined = rows.join('\n');
   ok(joined.includes('a.jpg') && joined.includes('b.jpg'), 'extra images assigned to fallback reviews');
   eq(rows.length, 2, 'more images than reviews: still 2 rows');
 
   // string image items (legacy) tolerated
-  rows = G.buildCsvRows([rev({ has_photo: true })], 'Dropy-X', ['plain-url.jpg']);
+  rows = G.buildCsvRows([rev({ has_photo: true })], P, ['plain-url.jpg']);
   ok(rows[0].includes('plain-url.jpg'), 'string image item tolerated');
 
-  // CSV escaping inside a row
-  rows = G.buildCsvRows([rev({ review_body: 'a, b "c"', reviewer_name: 'Doe, John' })], 'Dropy-X', []);
+  // CSV escaping inside a row + email squashes punctuation/space
+  rows = G.buildCsvRows([rev({ review_body: 'a, b "c"', reviewer_name: 'Doe, John' })], P, []);
   ok(rows[0].includes('"a, b ""c"""') && rows[0].includes('"Doe, John"'), 'row-level CSV escaping');
+  ok(rows[0].includes('doejohn@customer.review'), 'email squashes name punctuation/space');
 }
 
 // ===================== classifyResult =====================

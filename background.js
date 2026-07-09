@@ -1034,6 +1034,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!data || !data.name) { sendResponse({ error: 'Could not scrape dropy product', name: '' }); return; }
       data.productUrl = productUrl;
       data.dropyMatched = !!(found && found.matched); // ASIN confirmed in the product JSON
+      // Product identifiers for the Judge.me import (product_handle / product_url /
+      // product_id). The store reuses dropy's handle, so this URL resolves on it.
+      const dHandle = (productUrl.split('/products/')[1] || '').split(/[?#]/)[0];
+      data.productHandle = dHandle;
+      if (SHOPIFY.domain && dHandle) data.storeProductUrl = `https://${SHOPIFY.domain}/products/${dHandle}`;
 
       // Get the ORIGINAL, untouched image files from Shopify's public product
       // JSON on the myshopify domain (cdn.shopify.com URLs — no Cloudflare, no
@@ -1044,6 +1049,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const r = await fetch(`https://${SHOPIFY.domain}/products/${handle}.js`);
           if (r.ok) {
             const pj = await r.json();
+            // The store's real Shopify product id + handle — the strongest Judge.me match keys.
+            if (pj && pj.id != null) data.productId = String(pj.id);
+            if (pj && pj.handle) { data.productHandle = pj.handle; data.storeProductUrl = `https://${SHOPIFY.domain}/products/${pj.handle}`; }
             if (Array.isArray(pj.images) && pj.images.length) {
               data.originalImages = pj.images.map((u) => (u && u.startsWith('//')) ? ('https:' + u) : u).filter(Boolean);
             }

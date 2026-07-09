@@ -1448,7 +1448,7 @@ async function generateProduct(job) {
     updateProductStatus('Adding reviews to combined CSV...', productName);
     // SKU is deterministic from the input ASIN — always filled. Pass image items
     // ({url, persona}) so each photo lands on a same-gender review.
-    const rows = buildCsvRows(allReviews, sku, productData.photoItems || []);
+    const rows = buildCsvRows(allReviews, productData, productData.photoItems || []);
     csvBatch.rows.push(...rows);
     log(`✅ ${allReviews.length} reviews added to the combined CSV (file total: ${csvBatch.rows.length})`, 'success');
   } else {
@@ -1680,12 +1680,27 @@ function csvField(v) {
 
 // Review-import column format:
 // title,body,rating,review_date,reviewer_name,product_sku,picture_urls
-const CSV_HEADERS = ['title', 'body', 'rating', 'review_date', 'reviewer_name', 'product_sku', 'picture_urls'];
+// Judge.me import format. Product is matched by product_id (strongest), then
+// product_handle / product_url. reviewer_email is generated from the name.
+const CSV_HEADERS = ['title', 'body', 'rating', 'review_date', 'reviewer_name', 'reviewer_email', 'product_url', 'picture_urls', 'product_id', 'product_handle'];
+
+// Synthesizes a stable reviewer email from the name (e.g. "Kelly M" -> kelly.m@...
+// style, but Judge.me wants a plain address): <namesquashed>@customer.review.
+function reviewerEmail(name) {
+  const local = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return (local || 'reviewer') + '@customer.review';
+}
 
 // Builds the CSV DATA rows (no header) for ONE product's reviews. Image-to-review
 // matching is per-product, so this runs once per product and the rows are
 // concatenated into a single combined file for the whole run.
-function buildCsvRows(reviews, productSku, imageItems) {
+function buildCsvRows(reviews, product, imageItems) {
+  // `product` carries the Judge.me match keys from the dropy/Shopify lookup.
+  // (A bare string is tolerated as a legacy handle for older callers/tests.)
+  const p = (product && typeof product === 'object') ? product : { productHandle: product };
+  const handle = p.productHandle || p.handle || '';
+  const productId = p.productId || p.product_id || '';
+  const productUrl = p.storeProductUrl || p.productUrl || p.product_url || '';
   // Attach each photo to a has_photo review whose GENDER matches the image's
   // persona (female photo -> female reviewer, etc.) so picture and reviewer
   // stay consistent. 'neutral'/'kids' accept any reviewer.
@@ -1714,8 +1729,11 @@ function buildCsvRows(reviews, productSku, imageItems) {
     csvField(r.star_rating || 5),
     csvField(formatReviewDate(r.date)),
     csvField(r.reviewer_name || ''),
-    csvField(productSku || ''),
-    csvField(picByIndex[i] || '')
+    csvField(reviewerEmail(r.reviewer_name)),
+    csvField(productUrl),
+    csvField(picByIndex[i] || ''),
+    csvField(productId),
+    csvField(handle)
   ].join(','));
 }
 
