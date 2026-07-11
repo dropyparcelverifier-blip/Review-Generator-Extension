@@ -315,6 +315,30 @@ async function run() {
   eq(T.snap().fileName, 'cerave_images_5photos.csv', 'F3 total image count (5) in the filename');
   T.setFileBase('');
 
+  // F4 regenerating an ASIN whose rows were migrated into __prior doesn't duplicate.
+  resetStore();
+  localStore.doneAsins = ['C', 'X'];
+  localStore.csvBatch = { fileName: 'legacy.csv', rows: ['r:C:0', 'old:X'], asins: ['C', 'X'] };
+  T.resetState();
+  T.setFileBase('legacy'); T.setProducts(P('C')); T.install({});
+  globalThis.__forceRegen = true;
+  await T.startProcessing('text');
+  globalThis.__forceRegen = false;
+  eq(T.snap().rows, ['old:X', 'r:C:0'], 'F4 regenerated C not duplicated (legacy __prior row purged)');
+  T.setFileBase('');
+
+  // F5 a DIFFERENT list that merely SHARES one ASIN must start its OWN fresh batch —
+  // never merge the other list's product in or clobber its file (the MEDIUM bug).
+  resetStore(); T.setFileBase('lista'); T.setProducts(P('X', 'Y')); T.install({});
+  await T.startProcessing('text');
+  eq(T.snap().rows, ['r:X:0', 'r:Y:0'], 'F5 list A = X,Y');
+  T.resetState(); T.setFileBase('listb'); T.setProducts(P('Y', 'Z')); T.install({});
+  await T.startProcessing('text');
+  const s5 = T.snap();
+  eq(s5.fileName, 'listb.csv', 'F5 list B writes its OWN file');
+  eq(s5.rows, ['r:Z:0'], 'F5 list B is fresh — list A\'s X did NOT leak in');
+  T.setFileBase('');
+
   // ============================================================
   // CROSS-MODE ISOLATION (X1) — a text run and an image run over the SAME list
   // are independent: neither skips the other's ASINs, each writes its own file.

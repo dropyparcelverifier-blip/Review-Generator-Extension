@@ -659,9 +659,13 @@ async function startProcessing(mode) {
   const base = uploadedFileBase ? `${uploadedFileBase}${suffix}` : `reviews${suffix}_${dateStr}_${Date.now()}`;
   const persisted = await loadCsvBatch(); // reads the active mode's batch key
   const persistedBase = persisted && (persisted.base || (persisted.fileName ? String(persisted.fileName).replace(/\.csv$/i, '') : ''));
-  const overlaps = persisted && Array.isArray(persisted.asins) && products.some((p) => persisted.asins.includes(p.asin));
+  // Resume the persisted batch only when this run is a SUBSET of it (a rerun / Retry
+  // of the same list — EVERY current ASIN is already in the batch) OR it targets the
+  // same output file. Merely SHARING one ASIN with an unrelated list must NOT merge
+  // that list in or erase its file (a different upload starts its own fresh batch).
+  const isSubset = persisted && Array.isArray(persisted.asins) && products.every((p) => persisted.asins.includes(p.asin));
   const sameFile = persisted && persistedBase && uploadedFileBase && persistedBase === base;
-  if (persisted && (overlaps || sameFile)) {
+  if (persisted && (isSubset || sameFile)) {
     csvBatch = persisted;
   } else {
     csvBatch = { base, asins: products.map((p) => p.asin) };
@@ -2225,6 +2229,18 @@ function csvImageCount() {
 function setCsvProduct(asin, rows, images) {
   if (!csvBatch.rowsByAsin) csvBatch.rowsByAsin = {};
   if (!csvBatch.imgByAsin) csvBatch.imgByAsin = {};
+  // Legacy migrated rows live in `__prior` (an untagged blob). When this product is
+  // (re)written, drop any __prior rows for the SAME product (matched by the trailing
+  // product_id|product_handle columns) so a regenerate never duplicates them.
+  const prior = csvBatch.rowsByAsin.__prior;
+  if (prior && prior.length && rows && rows.length) {
+    const key = (r) => { const p = String(r).split(','); return (p[p.length - 2] || '').trim() + '|' + (p[p.length - 1] || '').trim(); };
+    const mine = new Set(rows.map(key).filter((k) => k !== '|')); // only real product ids/handles
+    if (mine.size) {
+      csvBatch.rowsByAsin.__prior = prior.filter((r) => !mine.has(key(r)));
+      if (!csvBatch.rowsByAsin.__prior.length) delete csvBatch.rowsByAsin.__prior;
+    }
+  }
   csvBatch.rowsByAsin[asin] = rows;
   csvBatch.imgByAsin[asin] = images || 0;
 }
