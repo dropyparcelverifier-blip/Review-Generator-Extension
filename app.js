@@ -649,54 +649,54 @@ async function startProcessing(mode) {
   const totalProducts = products.length;
   runSearchIds = []; runReviewIds = [];
 
-  // Resume vs. fresh batch for the combined CSV. The batch is identified by its
-  // ASIN list: if the current list overlaps the persisted batch's ASINs (a
-  // resume of the same list, or a Retry of its failed items), keep appending to
-  // the SAME file. A brand-new list starts a fresh file with a stable name
-  // (persisted so future re-runs reuse it instead of creating a duplicate).
-  // Image runs write a SEPARATE file (<name>_images.csv) and keep a SEPARATE
-  // batch in storage, so the text CSV and image CSV never overwrite each other.
+  // Resume vs. fresh batch for the combined CSV. Resume the SAME batch if the
+  // current run targets the same output file (`base`) OR shares any ASIN — so a
+  // rerun (even of just the failed ASIN, even after you DELETED the file on disk)
+  // MERGES into the existing reviews instead of overwriting them. This is the fix
+  // for "rerun clobbered the other ASINs". Image runs use a separate base/key.
   const suffix = runMode === 'image' ? '_images' : '';
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const base = uploadedFileBase ? `${uploadedFileBase}${suffix}` : `reviews${suffix}_${dateStr}_${Date.now()}`;
   const persisted = await loadCsvBatch(); // reads the active mode's batch key
-  const inSameBatch = persisted && persisted.fileName && Array.isArray(persisted.rows)
-    && Array.isArray(persisted.asins) && products.some((p) => persisted.asins.includes(p.asin));
-  if (inSameBatch) {
+  const persistedBase = persisted && (persisted.base || (persisted.fileName ? String(persisted.fileName).replace(/\.csv$/i, '') : ''));
+  const overlaps = persisted && Array.isArray(persisted.asins) && products.some((p) => persisted.asins.includes(p.asin));
+  const sameFile = persisted && persistedBase && uploadedFileBase && persistedBase === base;
+  if (persisted && (overlaps || sameFile)) {
     csvBatch = persisted;
   } else {
-    const dateStr = new Date().toISOString().slice(0, 10);
-    // Name the CSV after the uploaded file (falls back to a dated name).
-    const fname = uploadedFileBase ? `${uploadedFileBase}${suffix}.csv` : `reviews${suffix}_${dateStr}_${Date.now()}.csv`;
-    csvBatch = { fileName: fname, rows: [], asins: products.map((p) => p.asin) };
+    csvBatch = { base, asins: products.map((p) => p.asin) };
   }
-  // Always name the output after the CURRENT uploaded file (e.g. cerave.txt ->
-  // cerave.csv / cerave_images.csv), even when resuming. If the name changes, the
-  // file must be (re)written under the new name.
-  const wantName = uploadedFileBase ? `${uploadedFileBase}${suffix}.csv` : csvBatch.fileName;
-  if (uploadedFileBase && csvBatch.fileName !== wantName) {
-    csvBatch.fileName = wantName;
-    csvBatch.written = false;
-  }
+  migrateBatch(csvBatch); // ensure rowsByAsin/imgByAsin; carry legacy flat rows
+  // Follow the current uploaded name; if it changed, the file must be rewritten
+  // (and the old-name file erased on the next write).
+  if (uploadedFileBase && csvBatch.base !== base) { csvBatch.base = base; csvBatch.written = false; }
+  // Remember every ASIN this batch has ever covered so its rows are never dropped.
+  csvBatch.asins = Array.from(new Set([...(csvBatch.asins || []), ...products.map((p) => p.asin)]));
   // Persisted image selections (by ASIN), so a Stop/close during selection or
   // generation doesn't force you to re-pick — resume jumps straight to generating.
   if (!csvBatch.pending || typeof csvBatch.pending !== 'object') csvBatch.pending = {};
-  const rowsBefore = csvBatch.rows.length; // rows carried over from earlier runs of this batch
-  if (rowsBefore) log(`Resuming batch — appending to ${csvBatch.fileName} (${rowsBefore} review(s) already in it)`, 'info');
+  const rowsBefore = csvRowCount(); // rows carried over from earlier runs of this batch
+  if (rowsBefore) log(`Resuming batch — merging into ${csvFileName()} (${rowsBefore} review(s) already saved)`, 'info');
 
   resetStats(totalProducts);
   buildAsinTable(products);
   startTimer();
 
-  // Build the work list, skipping ASINs already completed in a previous run.
+  // Build the work list, skipping ASINs already completed in a previous run —
+  // UNLESS "regenerate already-done" is on, in which case done ASINs are reprocessed
+  // and their rows are REPLACED in the file (setCsvProduct), not duplicated.
+  const forceRegen = !!(document.getElementById('forceRegen') && document.getElementById('forceRegen').checked);
   const todo = [];
   for (let i = 0; i < totalProducts; i++) {
     const item = products[i];
-    if (doneAsins.has(item.asin)) {
+    if (doneAsins.has(item.asin) && !forceRegen) {
       updateAsinRow(i, 'done', item.asin, 'already done');
       log(`Skipping ${item.asin} — already done in a previous run`, 'info');
       results.push({ asin: item.asin, sku: item.sku, name: item.asin, reviews: 0, images: 0, alreadyDone: true });
       stats.done++;
       renderMetrics();
     } else {
+      if (doneAsins.has(item.asin)) log(`Regenerating ${item.asin} — overwriting its earlier reviews`, 'info');
       todo.push({ item, i });
     }
   }
@@ -930,19 +930,18 @@ async function startProcessing(mode) {
   // all-already-done batch adds nothing, so it must NOT re-download the old file.
   // The file is already streamed to disk after each product (flushCsvToDisk), so
   // this is a safety net: only (re)write if a per-product flush didn't land.
-  const addedThisRun = csvBatch.rows.length - rowsBefore;
-  if (csvBatch.rows.length && !csvBatch.written) {
-    const ok = await writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
-    csvBatch.written = !!ok;
+  const addedThisRun = csvRowCount() - rowsBefore;
+  if (csvRowCount() && !csvBatch.written) {
+    const ok = await writeCsvNow();
     await saveCsvBatch();
     log(ok
-      ? `✅ ${csvBatch.fileName} saved — ${addedThisRun} new this run, ${csvBatch.rows.length} reviews total in the file`
-      : `⚠ Couldn't write ${csvBatch.fileName} to disk — the reviews are saved inside the extension and will be written on the next run of this list.`,
+      ? `✅ ${csvFileName()} saved — ${addedThisRun} new this run, ${csvRowCount()} reviews total in the file`
+      : `⚠ Couldn't write ${csvFileName()} to disk — the reviews are saved inside the extension and will be written on the next run of this list.`,
       ok ? 'success' : 'warn');
-  } else if (csvBatch.rows.length) {
+  } else if (csvRowCount()) {
     const msg = addedThisRun > 0
-      ? `✅ ${csvBatch.fileName} — ${addedThisRun} new this run, ${csvBatch.rows.length} total (written to disk as it ran)`
-      : `No new reviews this run — ${csvBatch.fileName} already saved (not re-downloaded)`;
+      ? `✅ ${csvFileName()} — ${addedThisRun} new this run, ${csvRowCount()} total (written to disk as it ran)`
+      : `No new reviews this run — ${csvFileName()} already saved (not re-downloaded)`;
     log(msg, addedThisRun > 0 ? 'success' : 'info');
   }
 
@@ -1449,8 +1448,10 @@ async function generateProduct(job) {
     // SKU is deterministic from the input ASIN — always filled. Pass image items
     // ({url, persona}) so each photo lands on a same-gender review.
     const rows = buildCsvRows(allReviews, productData, productData.photoItems || []);
-    csvBatch.rows.push(...rows);
-    log(`✅ ${allReviews.length} reviews added to the combined CSV (file total: ${csvBatch.rows.length})`, 'success');
+    // SET (replace) this ASIN's slice — so a rerun of this ASIN overwrites just its
+    // own rows and never duplicates or drops the other ASINs already in the file.
+    setCsvProduct(asin, rows, (productData.imageUrls || []).length);
+    log(`✅ ${allReviews.length} reviews saved for this product (file total: ${csvRowCount()})`, 'success');
   } else {
     log('No reviews generated for this product', 'error');
   }
@@ -1750,13 +1751,13 @@ function writeCombinedCsv(rows, fileName) {
       // overwrite (not uniquify) so resuming a batch keeps ONE file, not copies.
       chrome.runtime.sendMessage({ action: 'save_file', filename: fileName, dataUrl, conflictAction: 'overwrite' }, (resp) => {
         if (chrome.runtime.lastError || !resp || !resp.ok) {
-          resolve(downloadCsvFallback(csv, fileName));
+          resolve({ ok: downloadCsvFallback(csv, fileName), downloadId: null });
         } else {
-          resolve(true);
+          resolve({ ok: true, downloadId: (resp.downloadId != null ? resp.downloadId : null) });
         }
       });
     } catch (e) {
-      resolve(downloadCsvFallback(csv, fileName));
+      resolve({ ok: downloadCsvFallback(csv, fileName), downloadId: null });
     }
   });
 }
@@ -1768,10 +1769,7 @@ function writeCombinedCsv(rows, fileName) {
 // file. `written` is set true ONLY after the write is confirmed, so storage never
 // claims "on disk" when it isn't (else the run-end net wrongly skips the rewrite).
 async function flushCsvToDisk() {
-  if (!csvBatch || !csvBatch.rows.length) return false;
-  const ok = await writeCombinedCsv(csvBatch.rows, csvBatch.fileName);
-  if (ok) csvBatch.written = true;
-  return ok;
+  return writeCsvNow(); // writes the union of all ASINs' rows; sets `written` on success
 }
 
 // Throttled crash-proof write: keeps the on-disk file fresh WITHOUT one download
@@ -2187,6 +2185,68 @@ function resetProgress() {
   csvBatch = null;
   try { chrome.storage.local.remove(['csvBatch', 'csvBatchImage']); } catch (e) {}
   updateProgressUi();
+}
+
+// --- Per-ASIN row storage: the batch keeps each ASIN's rows SEPARATELY so a
+// rerun of one ASIN replaces only its own rows (never duplicates, never drops the
+// others), and every write is the UNION of all completed ASINs. This is what makes
+// re-running a failed/finished ASIN safe and non-destructive. ---
+function migrateBatch(b) {
+  if (!b) return;
+  if (!b.rowsByAsin) b.rowsByAsin = {};
+  if (!b.imgByAsin) b.imgByAsin = {};
+  // Legacy flat `rows` array (older batches) -> keep them under a reserved key so
+  // nothing already generated is ever lost on upgrade.
+  if (Array.isArray(b.rows) && b.rows.length && !b.rowsByAsin.__prior) b.rowsByAsin.__prior = b.rows;
+  delete b.rows;
+  if (!b.base && b.fileName) b.base = String(b.fileName).replace(/\.csv$/i, '');
+  delete b.fileName;
+}
+function csvAllRows() {
+  const m = (csvBatch && csvBatch.rowsByAsin) || {};
+  const out = [];
+  for (const k of Object.keys(m)) out.push(...(m[k] || []));
+  return out;
+}
+function csvRowCount() {
+  const m = (csvBatch && csvBatch.rowsByAsin) || {};
+  let n = 0; for (const k in m) n += (m[k] || []).length; return n;
+}
+function csvImageCount() {
+  const m = (csvBatch && csvBatch.imgByAsin) || {};
+  let n = 0; for (const k in m) n += (m[k] || 0); return n;
+}
+// SET (replace) one ASIN's rows + image count — so regenerating that ASIN overwrites
+// just its slice of the file.
+function setCsvProduct(asin, rows, images) {
+  if (!csvBatch.rowsByAsin) csvBatch.rowsByAsin = {};
+  if (!csvBatch.imgByAsin) csvBatch.imgByAsin = {};
+  csvBatch.rowsByAsin[asin] = rows;
+  csvBatch.imgByAsin[asin] = images || 0;
+}
+// The current output filename: base + (image-mode) the total photo count, so the
+// count is visible right in the file name (e.g. cerave_images_45photos.csv).
+function csvFileName() {
+  if (!csvBatch) return '';
+  const n = runMode === 'image' ? csvImageCount() : 0;
+  return `${csvBatch.base}${n ? `_${n}photos` : ''}.csv`;
+}
+// Central write: (over)writes the union of all ASINs' rows to disk. When the image
+// count changes the file name changes, so erase the previous file to keep it ONE
+// file (not a pile of _10/_20/_30photos.csv). Returns true on a confirmed write.
+async function writeCsvNow() {
+  if (!csvBatch || !csvRowCount()) return false;
+  const name = csvFileName();
+  const res = await writeCombinedCsv(csvAllRows(), name);
+  if (res && res.ok) {
+    csvBatch.written = true;
+    if (csvBatch.lastFile && csvBatch.lastFile !== name && csvBatch.lastDownloadId != null) {
+      try { chrome.runtime.sendMessage({ action: 'erase_download', id: csvBatch.lastDownloadId }); } catch (e) {}
+    }
+    csvBatch.lastFile = name;
+    if (res.downloadId != null) csvBatch.lastDownloadId = res.downloadId;
+  }
+  return !!(res && res.ok);
 }
 
 // --- Combined CSV batch: persisted so Stop→Continue/resume keeps ONE file ---

@@ -37,8 +37,13 @@ globalThis.__t = {
       }
       const s = (spec.gen && spec.gen[job.item.asin]) || { reviews: 1 };
       const n = spec.genAllZero ? 0 : (s.reviews == null ? 1 : s.reviews); // genAllZero simulates Gemini logged out
-      for (let x = 0; x < n; x++) csvBatch.rows.push('r:' + job.item.asin + ':' + x);
-      return { asin: job.item.asin, sku: job.item.sku, name: job.productData.name, reviews: n, images: 0, error: n ? null : 'no reviews' };
+      const imgs = (spec.imagesFor && spec.imagesFor[job.item.asin]) || 0;
+      if (n > 0) {
+        const arr = [];
+        for (let x = 0; x < n; x++) arr.push('r:' + job.item.asin + ':' + x);
+        setCsvProduct(job.item.asin, arr, imgs); // per-ASIN replace (was rows.push)
+      }
+      return { asin: job.item.asin, sku: job.item.sku, name: job.productData.name, reviews: n, images: imgs, error: n ? null : 'no reviews' };
     };
     pickImages = async (cands) => {
       globalThis.__pickCount++;
@@ -51,8 +56,8 @@ globalThis.__t = {
   },
   snap: () => ({
     prepareCalls: globalThis.__prepareCalls.slice(),
-    rows: csvBatch ? csvBatch.rows.slice() : null,
-    fileName: csvBatch ? csvBatch.fileName : null,
+    rows: csvBatch ? csvAllRows() : null,
+    fileName: csvBatch ? csvFileName() : null,
     asins: csvBatch ? csvBatch.asins : null,
     pickCount: globalThis.__pickCount,
   }),
@@ -66,11 +71,11 @@ function makeEl() {
   const fn = function () { return fn; };
   return new Proxy(fn, { get(t, p) { if (p === 'classList') return { add(){},remove(){},toggle(){},contains(){return false;} }; if (p==='style') return {}; if (p==='dataset') return {}; if (['value','textContent','innerHTML','innerText'].includes(p)) return ''; if (p==='checked') return false; if (p==='querySelectorAll') return ()=>[]; if (p==='querySelector') return ()=>null; if (typeof p==='symbol') return ()=> ''; return makeEl(); }, set(){return true;}, apply(){return makeEl();} });
 }
-const document = { getElementById: () => makeEl(), querySelector: () => null, querySelectorAll: () => [], createElement: () => makeEl(), body: makeEl(), addEventListener(){} };
+const document = { getElementById: (id) => (id === 'forceRegen' ? { checked: !!globalThis.__forceRegen } : makeEl()), querySelector: () => null, querySelectorAll: () => [], createElement: () => makeEl(), body: makeEl(), addEventListener(){} };
 const chromeStub = {
   runtime: {
     lastError: null,
-    sendMessage: (msg, cb) => { if (msg && msg.action === 'save_file') saved.push({ filename: msg.filename, conflictAction: msg.conflictAction }); if (cb) cb({ ok: true }); },
+    sendMessage: (msg, cb) => { if (msg && msg.action === 'save_file') saved.push({ filename: msg.filename, conflictAction: msg.conflictAction }); if (cb) cb(msg && msg.action === 'save_file' ? { ok: true, downloadId: saved.length } : { ok: true }); },
     onMessage: { addListener(){} },
   },
   storage: {
@@ -284,6 +289,31 @@ async function run() {
   eq(s.rows, [], 'T6 nothing generated (simulated Gemini logout)');
   eq(s.prepareCalls, ['A', 'B', 'C'], 'T6 stops after 3 systemic failures, not all 6');
   ok(!localStore.doneAsins || localStore.doneAsins.length === 0, 'T6 nothing marked done');
+
+  // F1 rerun a FAILED asin merges into the file (the reported data-loss bug):
+  // A,B done + C failed, then rerun only C -> A,B must be preserved, C added.
+  resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({ gen: { C: { reviews: 0 } } });
+  await T.startProcessing('text');
+  eq(T.snap().rows, ['r:A:0', 'r:B:0'], 'F1 A,B done, C failed');
+  T.resetState(); T.setProducts(P('C')); T.install({});
+  await T.startProcessing('text');
+  eq(T.snap().rows, ['r:A:0', 'r:B:0', 'r:C:0'], 'F1 rerun C MERGES (A,B not clobbered)');
+
+  // F2 force-regenerate a finished asin REPLACES its rows (no dup), keeps the others.
+  resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({});
+  await T.startProcessing('text');
+  eq(T.snap().rows, ['r:A:0', 'r:B:0', 'r:C:0'], 'F2 initial 3 products done');
+  T.resetState(); T.setProducts(P('B')); T.install({ gen: { B: { reviews: 2 } } });
+  globalThis.__forceRegen = true;
+  await T.startProcessing('text');
+  globalThis.__forceRegen = false;
+  eq(T.snap().rows, ['r:A:0', 'r:B:0', 'r:B:1', 'r:C:0'], 'F2 B regenerated (replaced with 2 rows), A&C preserved');
+
+  // F3 total image count is stamped into the image filename
+  resetStore(); T.setFileBase('cerave'); T.setProducts(P('A', 'B')); T.install({ imagesFor: { A: 3, B: 2 } });
+  await T.startProcessing('image');
+  eq(T.snap().fileName, 'cerave_images_5photos.csv', 'F3 total image count (5) in the filename');
+  T.setFileBase('');
 
   // ============================================================
   // CROSS-MODE ISOLATION (X1) — a text run and an image run over the SAME list

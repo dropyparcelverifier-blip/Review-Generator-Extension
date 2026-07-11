@@ -1005,6 +1005,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.action === 'erase_download') {
+    // Delete a previously-downloaded CSV (used when the count in the filename
+    // changes) so the batch stays ONE file instead of piling up copies.
+    try {
+      chrome.downloads.removeFile(msg.id, () => {
+        void chrome.runtime.lastError; // file may already be gone — ignore
+        chrome.downloads.erase({ id: msg.id }, () => { void chrome.runtime.lastError; });
+      });
+    } catch (e) { /* best-effort */ }
+    sendResponse({ ok: true });
+    return true;
+  }
+
   if (msg.action === 'scrape_amazon') {
     const domains = (msg.domains && msg.domains.length) ? msg.domains : ['www.amazon.in', 'www.amazon.com'];
     scrapeAmazonAcrossDomains(msg.asin, domains, sendResponse);

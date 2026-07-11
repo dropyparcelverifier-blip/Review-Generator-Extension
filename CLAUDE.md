@@ -58,10 +58,20 @@ JSON fetched by the dropy handle in `dropy_lookup` (the store reuses dropy's han
 ## Persistence (`chrome.storage.local`) — **namespaced by mode**
 - `doneAsins` (text) / `doneAsinsImage` (image) — completed ASINs per mode, skipped on
   re-run. Separate so a text run never makes the image run skip that ASIN (or vice-versa).
-- `csvBatch` (text) / `csvBatchImage` (image) — `{ fileName, rows, asins, pending }`.
-  `rows` accumulate; `pending` holds saved image selections by ASIN (image mode only).
-  Persisted after each product (crash-safe); an ASIN is marked done only after rows persist.
-  The active mode's key is chosen by `doneStoreKey()` / `csvStoreKey()`.
+- `csvBatch` (text) / `csvBatchImage` (image) — `{ base, asins, rowsByAsin, imgByAsin,
+  pending, written, lastFile, lastDownloadId }`. **Rows are keyed per-ASIN** (`rowsByAsin`)
+  so re-running one ASIN REPLACES just its slice (`setCsvProduct`) — never duplicates,
+  never drops the others; every write is the UNION (`csvAllRows`). `pending` holds saved
+  image selections by ASIN (image mode only). Persisted after each product (crash-safe);
+  an ASIN is marked done only after rows persist. Legacy flat `rows`/`fileName` are
+  migrated on load (`migrateBatch`). The active mode's key is `doneStoreKey()`/`csvStoreKey()`.
+- **Resume identity (`base`):** a run resumes the SAME batch if it targets the same
+  output `base` OR shares any ASIN — so a rerun (even of just the failed ASIN, even after
+  you deleted the file) MERGES instead of overwriting. The **Regenerate already-done**
+  checkbox (`forceRegen`) reprocesses done ASINs and replaces their rows.
+- **Filename** is derived (`csvFileName`): `<base>.csv`, or image mode `<base>_<N>photos.csv`
+  where N is the total photo count. When N changes the old file is erased (`erase_download`)
+  so it stays ONE file. `lastDownloadId` tracks the file to erase.
 - **Crash-proof disk file:** `maybeFlushCsvToDisk()` (over)writes the CSV to disk during
   the run — on the 1st product, then throttled to at most every `CSV_FLUSH_EVERY` (5)
   products or `CSV_FLUSH_MS` (30s) — so a power loss mid-run leaves a near-complete file
