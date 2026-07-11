@@ -791,8 +791,10 @@ async function startProcessing(mode) {
     // re-scrape and re-pick entirely and hand it straight to Phase 2.
     const savedPick = csvBatch.pending[item.asin];
     if (savedPick && savedPick.productData) {
-      log(`Restored your earlier selection for ${item.asin} — no re-scrape needed`, 'info');
-      updateAsinRow(i, 'queued', savedPick.productData.name || item.asin, 'ready (restored)');
+      const selCount = (savedPick.selected || []).length;
+      log(`Restored your earlier selection for ${item.asin} (${selCount} image(s)) — no re-scrape needed`, 'info');
+      updateAsinRow(i, 'queued', savedPick.productData.name || item.asin, `${selCount} img selected (restored)`);
+      stats.images += selCount; renderMetrics(); // count selected photos toward the total
       prepared.push({ item, i, productData: savedPick.productData, selected: savedPick.selected || [] });
       continue;
     }
@@ -855,7 +857,8 @@ async function startProcessing(mode) {
     await saveCsvBatch();
 
     prepared.push({ item, i, productData: data.productData, selected });
-    updateAsinRow(i, 'queued', data.productData.name, unverified ? '⚠ unverified — ready' : 'ready — generating in bg');
+    stats.images += selected.length; renderMetrics(); // running total of selected photos
+    updateAsinRow(i, 'queued', data.productData.name, `${selected.length} img selected${unverified ? ' · ⚠ unverified' : ''}`);
   }
 
   // ============================================================
@@ -915,7 +918,8 @@ async function startProcessing(mode) {
 
     stats.done++;
     stats.reviews += (result.reviews || 0);
-    stats.images += (result.images || 0);
+    // NOTE: images are counted once, at selection time in Phase 1 (not here) — so
+    // the Images metric reflects total SELECTED photos and isn't double-counted.
     if (result.error || (result.reviews || 0) === 0) stats.issues++;
     renderMetrics();
 
