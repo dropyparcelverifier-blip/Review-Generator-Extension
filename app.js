@@ -350,6 +350,19 @@ async function waitWhilePaused() {
 let pickResolve = null;
 let pickItems = [];
 
+// Safety net: if the picker is in "real photos only" mode and every real-photo cell
+// got filtered out (too small / broken / removed), auto-switch to showing ALL so you
+// are never stranded with an empty grid and a run that appears frozen.
+function maybeUnfilterPicker() {
+  const box = document.getElementById('ugcOnly');
+  if (!box || !box.checked) return;
+  if (imageGrid.querySelector('.image-cell.ugc')) return; // real photos still visible
+  box.checked = false;
+  imageGrid.classList.remove('ugc-only');
+  const hint = document.getElementById('pickerHint');
+  if (hint) hint.textContent = 'No real-photo matches remained — showing ALL candidates. Tap ✓ keep, ✕ remove, ⤢ enlarge.';
+}
+
 // items: array of { url, dataUrl }. Displays dataUrl (reliable) or url, and
 // resolves with the selected items (objects), preserving url + bytes.
 function pickImages(items) {
@@ -362,6 +375,8 @@ function pickImages(items) {
       const cell = document.createElement('div');
       cell.className = 'image-cell' + (item.ugc ? ' ugc' : '');
       cell.dataset.idx = idx;
+      // Remove a cell AND keep the grid from ending up empty in real-only mode.
+      const drop = () => { if (cell.parentNode) cell.remove(); maybeUnfilterPicker(); };
 
       // Badge genuine user-taken photos (social / customer-review sources) so the
       // real-vibe ones stand out from catalog shots.
@@ -376,12 +391,12 @@ function pickImages(items) {
       const img = document.createElement('img');
       img.src = display;
       img.loading = 'lazy';
-      img.onerror = () => cell.remove(); // drop images that won't load
+      img.onerror = () => drop(); // drop images that won't load
       img.onload = () => {
         const w = img.naturalWidth || 0, h = img.naturalHeight || 0;
         const r = h ? w / h : 1;
         // Drop banner/ad shapes (the preview keeps the real aspect ratio).
-        if (w && h && (r > 2.4 || r < 0.4)) cell.remove();
+        if (w && h && (r > 2.4 || r < 0.4)) drop();
       };
 
       // The picker shows the thumbnail, but we UPLOAD `item.url` — probe ITS real
@@ -394,7 +409,7 @@ function pickImages(items) {
         const probe = new Image();
         probe.onload = () => {
           const pw = probe.naturalWidth || 0, ph = probe.naturalHeight || 0;
-          if (pw && ph && Math.min(pw, ph) < MIN_UPLOAD_PX) cell.remove();
+          if (pw && ph && Math.min(pw, ph) < MIN_UPLOAD_PX) drop();
         };
         probe.src = item.url;
       }
@@ -426,7 +441,7 @@ function pickImages(items) {
       removeBtn.className = 'cell-btn cell-remove';
       removeBtn.title = 'Remove this image';
       removeBtn.textContent = '✕';
-      removeBtn.addEventListener('click', (e) => { e.stopPropagation(); cell.remove(); });
+      removeBtn.addEventListener('click', (e) => { e.stopPropagation(); drop(); });
 
       // ⤢ open the original full-size image in a new tab to inspect
       const zoom = document.createElement('a');
@@ -448,6 +463,7 @@ function pickImages(items) {
     });
     pickItems = items;
     imagePicker.classList.remove('hidden');
+    try { imagePicker.scrollIntoView({ block: 'nearest' }); } catch (e) {}
 
     // Start from the REAL set only when there are enough genuine photos to be
     // useful (>= 6). Otherwise show all (real sorted first + badged) so we never
