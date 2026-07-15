@@ -922,6 +922,12 @@ async function startProcessing(mode) {
 
   // --- skipped products → TEXT reviews into a SEPARATE <name>.csv batch/file ---
   if (textJobs.length && isProcessing) {
+    // Consume the skipped products' picks from the IMAGE batch's pending now (they're
+    // handled as text) — so they don't linger as stale pending, AND so a later
+    // Regenerate re-offers their picker (re-scrapes) instead of silently redoing text.
+    let clearedPending = false;
+    textJobs.forEach((j) => { if (csvBatch.pending && csvBatch.pending[j.item.asin]) { delete csvBatch.pending[j.item.asin]; clearedPending = true; } });
+    if (clearedPending) await saveCsvBatch(); // csvBatch is still the IMAGE batch here
     csvBatch = await prepareBatch('text', textJobs.map((j) => j.item)); // active batch → text
     csvSinceFlush = 0; csvLastFlushAt = 0;                              // fresh throttle for it
     const textRowsBefore = csvRowCount();

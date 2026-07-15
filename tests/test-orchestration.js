@@ -324,6 +324,7 @@ async function run() {
   ok(localStore.csvBatch && localStore.csvBatch.rowsByAsin && localStore.csvBatch.rowsByAsin.B, 'F7 skipped product B -> TEXT file');
   ok(!localStore.csvBatch.rowsByAsin.A, 'F7 photo product A is NOT in the text file');
   eq(localStore.doneAsinsImage.sort(), ['A', 'B'], 'F7 both marked done in the image run');
+  ok(!localStore.csvBatchImage.pending || !localStore.csvBatchImage.pending.B, 'F7 skipped B pending cleared from image batch (no cruft; regen re-offers picker)');
   T.setFileBase('');
 
   // F6 image mode scrapes ALL products BEFORE any picking (scrape-all → pick-all)
