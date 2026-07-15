@@ -45,9 +45,14 @@ its own progress + output file (run text now, images later — order doesn't mat
   - **Phase 1b — Pick ALL (interactive):** once scraping is fully done, shows the
     picker for each product back-to-back. Selections persist per-ASIN
     (`csvBatchImage.pending`) so Stop/close doesn't force a re-pick.
-  - **Phase 2 — Generation (unattended):** `generateProduct({…, mode:'image'})` hosts
-    picked images on Shopify Files, then generates **exactly one review per hosted
-    photo** (every review carries a photo) → **`<name>_images.csv`**.
+  - **Phase 2 — Generation (unattended):** products WITH photos → `generateProduct(
+    {…, mode:'image'})` hosts images on Shopify Files + one review per photo →
+    **`<name>_images.csv`**. Products you **SKIPPED (0 photos)** → `generateProduct(
+    {…, mode:'text'})` → **text reviews into `<name>.csv`** (a SECOND batch,
+    `prepareBatch('text', …)`; the active `csvBatch` is swapped for these). So ONE image
+    run can emit both files. Both mark done in the IMAGE set only (`runMode` stays
+    'image'). Each batch is self-describing (`.key`, `.isImage`) and finalizes its own
+    file via `finalizeBatchWrite`.
 
 Both: 1) upload `.txt/.csv/.xlsx` → `extractAsin` → `products`; 4) **one CSV per batch**,
 `conflictAction:'overwrite'` + stable filename so Stop→resume keeps the SAME file.

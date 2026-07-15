@@ -665,36 +665,10 @@ async function startProcessing(mode) {
   const totalProducts = products.length;
   runSearchIds = []; runReviewIds = [];
 
-  // Resume vs. fresh batch for the combined CSV. Resume the SAME batch if the
-  // current run targets the same output file (`base`) OR shares any ASIN — so a
-  // rerun (even of just the failed ASIN, even after you DELETED the file on disk)
-  // MERGES into the existing reviews instead of overwriting them. This is the fix
-  // for "rerun clobbered the other ASINs". Image runs use a separate base/key.
-  const suffix = runMode === 'image' ? '_images' : '';
-  const dateStr = new Date().toISOString().slice(0, 10);
-  const base = uploadedFileBase ? `${uploadedFileBase}${suffix}` : `reviews${suffix}_${dateStr}_${Date.now()}`;
-  const persisted = await loadCsvBatch(); // reads the active mode's batch key
-  const persistedBase = persisted && (persisted.base || (persisted.fileName ? String(persisted.fileName).replace(/\.csv$/i, '') : ''));
-  // Resume the persisted batch only when this run is a SUBSET of it (a rerun / Retry
-  // of the same list — EVERY current ASIN is already in the batch) OR it targets the
-  // same output file. Merely SHARING one ASIN with an unrelated list must NOT merge
-  // that list in or erase its file (a different upload starts its own fresh batch).
-  const isSubset = persisted && Array.isArray(persisted.asins) && products.every((p) => persisted.asins.includes(p.asin));
-  const sameFile = persisted && persistedBase && uploadedFileBase && persistedBase === base;
-  if (persisted && (isSubset || sameFile)) {
-    csvBatch = persisted;
-  } else {
-    csvBatch = { base, asins: products.map((p) => p.asin) };
-  }
-  migrateBatch(csvBatch); // ensure rowsByAsin/imgByAsin; carry legacy flat rows
-  // Follow the current uploaded name; if it changed, the file must be rewritten
-  // (and the old-name file erased on the next write).
-  if (uploadedFileBase && csvBatch.base !== base) { csvBatch.base = base; csvBatch.written = false; }
-  // Remember every ASIN this batch has ever covered so its rows are never dropped.
-  csvBatch.asins = Array.from(new Set([...(csvBatch.asins || []), ...products.map((p) => p.asin)]));
-  // Persisted image selections (by ASIN), so a Stop/close during selection or
-  // generation doesn't force you to re-pick — resume jumps straight to generating.
-  if (!csvBatch.pending || typeof csvBatch.pending !== 'object') csvBatch.pending = {};
+  // Resume vs. fresh batch for the combined CSV (see prepareBatch): resume the SAME
+  // batch if this run is a subset of it OR targets the same output file, so a rerun
+  // MERGES instead of clobbering. Image runs use a separate base/key from text.
+  csvBatch = await prepareBatch(runMode, products);
   const rowsBefore = csvRowCount(); // rows carried over from earlier runs of this batch
   if (rowsBefore) log(`Resuming batch — merging into ${csvFileName()} (${rowsBefore} review(s) already saved)`, 'info');
 
@@ -790,6 +764,7 @@ async function startProcessing(mode) {
 
       if (k < todo.length - 1 && isProcessing) await sleep(800);
     }
+    await finalizeBatchWrite(rowsBefore); // write <name>.csv (safety net if last flush was throttled)
   } else {
   // ============================================================
   // IMAGE MODE — three phases: (1a) SCRAPE candidates for EVERY product up front
@@ -890,24 +865,26 @@ async function startProcessing(mode) {
   }
 
   // ============================================================
-  // PHASE 2 — GENERATION (unattended). All picks are done, so you're free.
-  // Reviews generate one product at a time (Gemini is a single tab) and stream
-  // into the combined CSV as they finish.
+  // PHASE 2 — GENERATION (unattended). Products WITH photos → image reviews (one per
+  // photo) into <name>_images.csv. Products you SKIPPED (0 photos) → TEXT reviews
+  // into <name>.csv. Both files come out of this one image run.
   // ============================================================
   setStepTitle('Step 3 of 3 · Generating reviews');
+  const imageJobs = prepared.filter((j) => (j.selected || []).length > 0);
+  const textJobs = prepared.filter((j) => (j.selected || []).length === 0);
   if (prepared.length && isProcessing) {
-    log(`Selections done — generating reviews for ${prepared.length} product(s) in the background. You can step away.`, 'success');
+    log(`Selections done — generating ${imageJobs.length} photo product(s)`
+      + (textJobs.length ? ` + ${textJobs.length} text-only (skipped) product(s)` : '')
+      + `. You can step away.`, 'success');
   }
-  for (let j = 0; j < prepared.length; j++) {
+
+  // Generate ONE prepared product into the ACTIVE csvBatch (image or text batch).
+  const runOneJob = async (job, idx, total) => {
     await waitWhilePaused();
-    if (!isProcessing) { log('Stopped during generation', 'warn'); break; }
-
-    const job = prepared[j];
-    job.mode = 'image'; // one review per selected photo, all carrying a photo
-    updateOverallProgress(j + 1, prepared.length);
+    if (!isProcessing) { log('Stopped during generation', 'warn'); return false; }
+    updateOverallProgress(idx + 1, total);
     updateAsinRow(job.i, 'processing', job.productData.name, 'generating...');
-    log(`Generating ${j + 1}/${prepared.length}: ${job.productData.name}`, 'info');
-
+    log(`Generating ${idx + 1}/${total}: ${job.productData.name}${job.mode === 'text' ? ' (text-only)' : ''}`, 'info');
     let result;
     try {
       result = await generateProduct(job);
@@ -915,67 +892,52 @@ async function startProcessing(mode) {
       log(`Error generating ${job.item.asin}: ${err.message}`, 'error');
       result = { asin: job.item.asin, sku: job.item.sku, name: job.productData.name || 'Error', reviews: 0, images: 0, error: err.message };
     }
-    // Carry the unverified flag onto the result so the completion summary flags it
-    // (same as text mode) — an unconfirmed ASIN shouldn't vanish after the run.
     const unv = job.productData.asinVerified === false;
     if (unv && (result.reviews || 0) > 0) result.unverified = true;
     results.push(result);
     updateAsinRow(job.i, classifyResult(result), result.name,
       `${result.reviews || 0} rev${result.images ? ` · ${result.images} img` : ''}${unv ? ' · ⚠ unverified' : ''}`);
-    checkGenHealth(result); // stop early if Gemini is logged out (nothing generating)
-
-    // Persist rows to storage and mark done AS EACH product finishes, so closing
-    // the panel mid-generation loses nothing and completed ASINs skip on resume
-    // (the file is rewritten from these rows below and on any resume). Only mark
-    // done if the persist actually succeeded — never skip unsaved reviews.
+    checkGenHealth(result);
     if ((result.reviews || 0) > 0) {
-      csvBatch.written = false; // new rows not on disk yet
-      delete csvBatch.pending[job.item.asin]; // selection consumed — no longer needed
-      const persisted = await saveCsvBatch();
-      if (persisted) markDone(job.item.asin);
-      if (await maybeFlushCsvToDisk()) await saveCsvBatch(); // throttled disk write; persist written=true only if it wrote
-    } else if ((job.selected || []).length === 0) {
-      // User deliberately picked NO photos for this product → record it as handled
-      // so it isn't re-scraped/re-prompted (and doesn't loop generating 0 reviews)
-      // on every resume. Genuine generation failures (selected>0, reviews=0) keep
-      // their pending so Retry/resume can try again.
+      csvBatch.written = false;
       delete csvBatch.pending[job.item.asin];
-      const persisted = await saveCsvBatch();
-      if (persisted) markDone(job.item.asin);
+      const persistedOk = await saveCsvBatch();
+      if (persistedOk) markDone(job.item.asin); // runMode stays 'image' → image done-set
+      if (await maybeFlushCsvToDisk()) await saveCsvBatch();
     }
-
     stats.done++;
     stats.reviews += (result.reviews || 0);
-    // NOTE: images are counted once, at selection time in Phase 1 (not here) — so
-    // the Images metric reflects total SELECTED photos and isn't double-counted.
     if (result.error || (result.reviews || 0) === 0) stats.issues++;
     renderMetrics();
+    return true;
+  };
 
-    if (j < prepared.length - 1 && isProcessing) await sleep(800);
+  // --- photo products → image reviews into the IMAGE file (current csvBatch) ---
+  for (let j = 0; j < imageJobs.length; j++) {
+    const job = imageJobs[j]; job.mode = 'image';
+    if (!(await runOneJob(job, j, imageJobs.length))) break;
+    if (j < imageJobs.length - 1 && isProcessing) await sleep(800);
+  }
+  await finalizeBatchWrite(rowsBefore); // finish the image file BEFORE switching batches
+
+  // --- skipped products → TEXT reviews into a SEPARATE <name>.csv batch/file ---
+  if (textJobs.length && isProcessing) {
+    csvBatch = await prepareBatch('text', textJobs.map((j) => j.item)); // active batch → text
+    csvSinceFlush = 0; csvLastFlushAt = 0;                              // fresh throttle for it
+    const textRowsBefore = csvRowCount();
+    log(`Now generating text-only reviews for ${textJobs.length} skipped product(s) → ${csvFileName()}`, 'info');
+    for (let j = 0; j < textJobs.length; j++) {
+      const job = textJobs[j]; job.mode = 'text';
+      if (!(await runOneJob(job, j, textJobs.length))) break;
+      if (j < textJobs.length - 1 && isProcessing) await sleep(800);
+    }
+    await finalizeBatchWrite(textRowsBefore);
   }
   } // end image mode
 
-  // Write/overwrite the ONE combined CSV for this batch — same file across
-  // Stop→Continue/resume (overwrite, never "reviews (1).csv"). Only (re)download
-  // when this run actually ADDED rows, or the file was never written for this
-  // batch (e.g. a prior run crashed before writing). A plain rerun of an
-  // all-already-done batch adds nothing, so it must NOT re-download the old file.
-  // The file is already streamed to disk after each product (flushCsvToDisk), so
-  // this is a safety net: only (re)write if a per-product flush didn't land.
-  const addedThisRun = csvRowCount() - rowsBefore;
-  if (csvRowCount() && !csvBatch.written) {
-    const ok = await writeCsvNow();
-    await saveCsvBatch();
-    log(ok
-      ? `✅ ${csvFileName()} saved — ${addedThisRun} new this run, ${csvRowCount()} reviews total in the file`
-      : `⚠ Couldn't write ${csvFileName()} to disk — the reviews are saved inside the extension and will be written on the next run of this list.`,
-      ok ? 'success' : 'warn');
-  } else if (csvRowCount()) {
-    const msg = addedThisRun > 0
-      ? `✅ ${csvFileName()} — ${addedThisRun} new this run, ${csvRowCount()} total (written to disk as it ran)`
-      : `No new reviews this run — ${csvFileName()} already saved (not re-downloaded)`;
-    log(msg, addedThisRun > 0 ? 'success' : 'info');
-  }
+  // Each branch already finalized its own file(s) via finalizeBatchWrite (text mode
+  // writes <name>.csv; image mode writes <name>_images.csv and, for skipped products,
+  // <name>.csv). Nothing more to write here.
 
   // Auto-delete the run's temporary Lens search images (disposable, never in the CSV).
   await autoCleanSearchImages();
@@ -2273,7 +2235,7 @@ function setCsvProduct(asin, rows, images) {
 // count is visible right in the file name (e.g. cerave_images_45photos.csv).
 function csvFileName() {
   if (!csvBatch) return '';
-  const n = runMode === 'image' ? csvImageCount() : 0;
+  const n = csvBatch.isImage ? csvImageCount() : 0;
   return `${csvBatch.base}${n ? `_${n}photos` : ''}.csv`;
 }
 // Central write: (over)writes the union of all ASINs' rows to disk. When the image
@@ -2294,23 +2256,63 @@ async function writeCsvNow() {
   return !!(res && res.ok);
 }
 
+// Run-end write for the CURRENT csvBatch: (re)writes the file if a per-product flush
+// didn't already land, then logs. `addedThisRun` = rows added since `rowsBefore`.
+async function finalizeBatchWrite(rowsBefore) {
+  const addedThisRun = csvRowCount() - rowsBefore;
+  if (csvRowCount() && !csvBatch.written) {
+    const ok = await writeCsvNow();
+    await saveCsvBatch();
+    log(ok
+      ? `✅ ${csvFileName()} saved — ${addedThisRun} new this run, ${csvRowCount()} reviews total in the file`
+      : `⚠ Couldn't write ${csvFileName()} to disk — the reviews are saved inside the extension and will be written on the next run of this list.`,
+      ok ? 'success' : 'warn');
+  } else if (csvRowCount()) {
+    const msg = addedThisRun > 0
+      ? `✅ ${csvFileName()} — ${addedThisRun} new this run, ${csvRowCount()} total (written to disk as it ran)`
+      : `No new reviews this run — ${csvFileName()} already saved (not re-downloaded)`;
+    log(msg, addedThisRun > 0 ? 'success' : 'info');
+  }
+}
+
 // --- Combined CSV batch: persisted so Stop→Continue/resume keeps ONE file ---
-function loadCsvBatch() {
-  const key = csvStoreKey();
+function loadCsvBatch(key) {
+  const k = key || csvStoreKey();
   return new Promise((resolve) => {
-    try { chrome.storage.local.get([key], (r) => resolve((r && r[key]) || null)); }
+    try { chrome.storage.local.get([k], (r) => resolve((r && r[k]) || null)); }
     catch (e) { resolve(null); }
   });
 }
-// Persists the batch (fileName + all rows so far) and resolves true on success.
-// Returns false if the write failed (e.g. storage quota) so callers can avoid
-// marking an ASIN "done" when its reviews weren't actually saved.
+// Persists the batch to ITS OWN storage key (a batch is self-describing via `.key`),
+// resolves true on success. Returns false on failure so callers can avoid marking an
+// ASIN "done" when its reviews weren't actually saved.
 function saveCsvBatch() {
-  const key = csvStoreKey();
+  const key = (csvBatch && csvBatch.key) || csvStoreKey();
   return new Promise((resolve) => {
     try { chrome.storage.local.set({ [key]: csvBatch }, () => resolve(!chrome.runtime.lastError)); }
     catch (e) { resolve(false); }
   });
+}
+// Build (or resume) a batch for `mode` over `productList`. Self-describing: carries
+// its storage `key` and `isImage` (for the _<N>photos filename suffix). Used for the
+// primary batch AND, in an image run, the secondary TEXT batch for skipped products.
+async function prepareBatch(mode, productList) {
+  const suffix = mode === 'image' ? '_images' : '';
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const base = uploadedFileBase ? `${uploadedFileBase}${suffix}` : `reviews${suffix}_${dateStr}_${Date.now()}`;
+  const key = mode === 'image' ? 'csvBatchImage' : 'csvBatch';
+  const persisted = await loadCsvBatch(key);
+  const persistedBase = persisted && (persisted.base || (persisted.fileName ? String(persisted.fileName).replace(/\.csv$/i, '') : ''));
+  const isSubset = persisted && Array.isArray(persisted.asins) && productList.every((p) => persisted.asins.includes(p.asin));
+  const sameFile = persisted && persistedBase && uploadedFileBase && persistedBase === base;
+  const b = (persisted && (isSubset || sameFile)) ? persisted : { base, asins: productList.map((p) => p.asin) };
+  b.key = key;
+  b.isImage = (mode === 'image');
+  migrateBatch(b);
+  if (uploadedFileBase && b.base !== base) { b.base = base; b.written = false; }
+  b.asins = Array.from(new Set([...(b.asins || []), ...productList.map((p) => p.asin)]));
+  if (!b.pending || typeof b.pending !== 'object') b.pending = {};
+  return b;
 }
 function updateProgressUi() {
   const el = document.getElementById('progressInfo');

@@ -32,11 +32,8 @@ globalThis.__t = {
     generateProduct = async (job) => {
       globalThis.__genCount++;
       if (spec.stopAfterGen && globalThis.__genCount >= spec.stopAfterGen) isProcessing = false;
-      // Mirror the real image-mode behavior: an empty photo selection generates
-      // nothing (0 reviews) and returns the "skipped" marker.
-      if (job.mode === 'image' && (job.selected || []).length === 0) {
-        return { asin: job.item.asin, sku: job.item.sku, name: job.productData.name, reviews: 0, images: 0, error: 'no images picked (skipped)' };
-      }
+      // (Empty photo picks are now routed as mode:'text' jobs, so they generate text
+      // reviews like any text product — no special 0-review case here.)
       const s = (spec.gen && spec.gen[job.item.asin]) || { reviews: 1 };
       const n = spec.genAllZero ? 0 : (s.reviews == null ? 1 : s.reviews); // genAllZero simulates Gemini logged out
       const imgs = (spec.imagesFor && spec.imagesFor[job.item.asin]) || 0;
@@ -51,7 +48,8 @@ globalThis.__t = {
       globalThis.__pickCount++;
       globalThis.__seq.push('pick');
       if (spec.stopAfterPick && globalThis.__pickCount >= spec.stopAfterPick) isProcessing = false;
-      if (spec.pickEmpty) return []; // simulate the user picking NO photos
+      if (spec.pickEmpty) return []; // simulate the user picking NO photos (all skip)
+      if (spec.skipPickIdx && spec.skipPickIdx.includes(globalThis.__pickCount)) return []; // skip specific picks
       return (cands || []).slice(0, 1);
     };
     sleep = async () => {};
@@ -227,13 +225,16 @@ async function run() {
   eq(T.snap().fileName, 'newname_images.csv', 'S11 resume follows the current uploaded file name');
   T.setFileBase(''); // reset for any later scenarios
 
-  // S12 image mode, user picks NO photos for a product -> handled once, not looped
-  resetStore(); T.setProducts(P('A')); T.install({ pickEmpty: true });
+  // S12 image mode, user picks NO photos (skip) -> TEXT reviews for that product into
+  // the TEXT file (<name>.csv); marked done in the IMAGE done-set only.
+  resetStore(); T.setFileBase('cerave'); T.setProducts(P('A')); T.install({ pickEmpty: true });
   await T.startProcessing('image');
-  s = T.snap();
-  eq(s.rows, [], 'S12 empty-pick product generates nothing');
-  eq(localStore.doneAsinsImage, ['A'], 'S12 intentional no-photo pick marked done (no infinite re-run)');
-  ok(!localStore.csvBatchImage.pending || !localStore.csvBatchImage.pending.A, 'S12 empty-pick pending cleared');
+  eq(localStore.doneAsinsImage, ['A'], 'S12 skipped product marked done (image run)');
+  ok(!localStore.doneAsins, 'S12 NOT marked in the text done-set (image run only)');
+  ok(localStore.csvBatch && localStore.csvBatch.rowsByAsin && localStore.csvBatch.rowsByAsin.A, 'S12 skipped product got TEXT reviews in the text file');
+  ok(!localStore.csvBatchImage.rowsByAsin || !localStore.csvBatchImage.rowsByAsin.A, 'S12 no image rows for the skipped product');
+  eq(T.snap().fileName, 'cerave.csv', 'S12 active output is the text file (cerave.csv)');
+  T.setFileBase('');
 
   // ============================================================
   // TEXT MODE (T1-T4) — fully automatic, NO image picking. Progress lives under
@@ -314,6 +315,16 @@ async function run() {
   await T.startProcessing('text');
   globalThis.__forceRegen = false;
   eq(T.snap().rows, ['r:A:0', 'r:B:0', 'r:B:1', 'r:C:0'], 'F2 B regenerated (replaced with 2 rows), A&C preserved');
+
+  // F7 image run MIX: photo product -> image file; skipped product -> TEXT file.
+  resetStore(); T.setFileBase('mix'); T.setProducts(P('A', 'B')); T.install({ skipPickIdx: [2] });
+  await T.startProcessing('image');
+  ok(localStore.csvBatchImage.rowsByAsin && localStore.csvBatchImage.rowsByAsin.A, 'F7 photo product A -> image file');
+  ok(!localStore.csvBatchImage.rowsByAsin.B, 'F7 skipped B is NOT in the image file');
+  ok(localStore.csvBatch && localStore.csvBatch.rowsByAsin && localStore.csvBatch.rowsByAsin.B, 'F7 skipped product B -> TEXT file');
+  ok(!localStore.csvBatch.rowsByAsin.A, 'F7 photo product A is NOT in the text file');
+  eq(localStore.doneAsinsImage.sort(), ['A', 'B'], 'F7 both marked done in the image run');
+  T.setFileBase('');
 
   // F6 image mode scrapes ALL products BEFORE any picking (scrape-all → pick-all)
   resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({});
