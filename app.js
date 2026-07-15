@@ -792,54 +792,44 @@ async function startProcessing(mode) {
     }
   } else {
   // ============================================================
-  // PHASE 1 — SELECTION (interactive). Pick images for every product
-  // back-to-back. While you pick one product, the NEXT is already being scraped
-  // in the background (1-ahead look-ahead) so its picker opens with no wait.
-  // Text generation is deferred to Phase 2 — you never wait on Gemini here.
+  // IMAGE MODE — three phases: (1a) SCRAPE candidates for EVERY product up front
+  // (unattended — walk away), (1b) PICK images for all of them in one
+  // uninterrupted pass, (2) GENERATE unattended. Scraping is fully finished before
+  // any picking so you never wait between selections.
   // ============================================================
-  setStepTitle('Step 1 of 2 · Select Images');
   const prepared = []; // { item, i, productData, selected } → generated in Phase 2
-  let prefetch = null; // { k, promise } — the next product being scraped ahead
+
+  // ---- PHASE 1a — SCRAPE ALL (no user interaction) ----
+  setStepTitle('Step 1 of 3 · Scraping all products');
+  if (todo.length && isProcessing) log(`Finding images for ${todo.length} product(s) — no picking yet, you can step away.`, 'info');
+  const toPick = []; // { item, i, data } freshly scraped, awaiting selection
   for (let k = 0; k < todo.length; k++) {
     await waitWhilePaused();
-    if (!isProcessing) { log('Stopped during selection', 'warn'); break; }
+    if (!isProcessing) { log('Stopped during scraping', 'warn'); break; }
 
     const { item, i } = todo[k];
     updateOverallProgress(k + 1, todo.length);
 
-    // Restore a previously-saved selection (from an interrupted run) — skip the
-    // re-scrape and re-pick entirely and hand it straight to Phase 2.
+    // Already-picked (restored from an interrupted run): no scrape, no re-pick —
+    // hand it straight to generation.
     const savedPick = csvBatch.pending[item.asin];
     if (savedPick && savedPick.productData) {
       const selCount = (savedPick.selected || []).length;
       log(`Restored your earlier selection for ${item.asin} (${selCount} image(s)) — no re-scrape needed`, 'info');
       updateAsinRow(i, 'queued', savedPick.productData.name || item.asin, `${selCount} img selected (restored)`);
-      stats.images += selCount; renderMetrics(); // count selected photos toward the total
+      stats.images += selCount; renderMetrics();
       prepared.push({ item, i, productData: savedPick.productData, selected: savedPick.selected || [] });
       continue;
     }
 
     updateAsinRow(i, 'processing', null, 'finding images...');
     updateProductStatus('Finding product & images...', item.asin);
-    log(`Selecting ${k + 1}/${todo.length}: ${item.asin}`, 'info');
-
-    // Use the prefetched scrape if it's for this product; else scrape now.
+    log(`Scraping ${k + 1}/${todo.length}: ${item.asin}`, 'info');
     let data;
     try {
-      data = (prefetch && prefetch.k === k) ? await prefetch.promise : await prepareProduct(item, i);
+      data = await prepareProduct(item, i);
     } catch (e) {
       data = { skip: true, error: e.message };
-    }
-    prefetch = null;
-
-    // Kick off scraping the NEXT product that ISN'T already restored-from-pending
-    // (those need no scrape) while you pick this one's images.
-    {
-      let j = k + 1;
-      while (j < todo.length && csvBatch.pending[todo[j].item.asin]) j++;
-      if (j < todo.length && isProcessing) {
-        prefetch = { k: j, promise: prepareProduct(todo[j].item, todo[j].i).catch((e) => ({ skip: true, error: e.message })) };
-      }
     }
 
     if (!data || data.skip) {
@@ -851,12 +841,27 @@ async function startProcessing(mode) {
       renderMetrics();
       continue;
     }
+    // Free the heaviest captured bytes we no longer need (the padded Lens SEARCH
+    // image); keep the candidates + gallery for the picker.
+    delete data.productData.imageData;
+    delete data.productData.image;
+    toPick.push({ item, i, data });
+    updateAsinRow(i, 'queued', data.productData.name, `${data.candidates.length} candidate(s) — ready to pick`);
+  }
 
-    // Interactive image pick. Hosting + generation happen in Phase 2.
+  // ---- PHASE 1b — PICK ALL (interactive, back-to-back) ----
+  setStepTitle('Step 2 of 3 · Select images');
+  if (toPick.length && isProcessing) log(`Scraping done — now pick images for ${toPick.length} product(s), back to back.`, 'success');
+  for (let p = 0; p < toPick.length; p++) {
+    await waitWhilePaused();
+    if (!isProcessing) { log('Stopped during selection', 'warn'); break; }
+
+    const { item, i, data } = toPick[p];
+    updateOverallProgress(p + 1, toPick.length);
     const unverified = data.productData.asinVerified === false;
     let selected = [];
     if (data.candidates.length && isProcessing) {
-      log('Select the review images, then click "Upload selected & continue"...', 'info');
+      log(`Select images ${p + 1}/${toPick.length}: ${item.asin} — then click "Upload selected & continue"`, 'info');
       const refName = unverified
         ? `⚠ UNVERIFIED — is this ${item.asin}?  ${data.productData.name}`
         : data.productData.name;
@@ -866,10 +871,7 @@ async function startProcessing(mode) {
       const discarded = data.candidates.length - selected.length;
       log(`${selected.length} image(s) selected → will upload · ${discarded} unselected discarded (not uploaded, no trace)`, selected.length ? 'success' : 'info');
     }
-    // Free the heavy captured image data (base64 galleries + padded Lens image)
-    // before buffering — Phase 2 only needs the text fields, `lensText`, and the
-    // picked `selected` items. Without this, dozens of buffered products would
-    // hold hundreds of MB of base64 in memory.
+    // Free the heavy captured image data before buffering for Phase 2.
     ['gallery', 'imageData', 'images', 'originalImages', 'image'].forEach((key) => { delete data.productData[key]; });
 
     // Persist this selection so a Stop/close before generation doesn't lose it.
@@ -886,7 +888,7 @@ async function startProcessing(mode) {
   // Reviews generate one product at a time (Gemini is a single tab) and stream
   // into the combined CSV as they finish.
   // ============================================================
-  setStepTitle('Step 2 of 2 · Generating Reviews');
+  setStepTitle('Step 3 of 3 · Generating reviews');
   if (prepared.length && isProcessing) {
     log(`Selections done — generating reviews for ${prepared.length} product(s) in the background. You can step away.`, 'success');
   }

@@ -37,11 +37,14 @@ its own progress + output file (run text now, images later — order doesn't mat
   dropy lookup (skips all image search), then `generateProduct({…, mode:'text'})`
   generates the configured min–max **text-only** reviews and streams rows into
   **`<name>.csv`**. Unattended — the user walks away.
-- **Image mode** (`startProcessing('image')`) — the interactive two-phase pipeline:
-  - **Phase 1 — Selection:** `prepareProduct` scrapes dropy + gathers candidate images
-    from **Lens, Google Images, Pinterest, Amazon reviews in PARALLEL**; you pick. A
-    **1-ahead prefetch** scrapes the next product while you pick. Selections persist
-    per-ASIN (`csvBatchImage.pending`) so Stop/close doesn't force a re-pick.
+- **Image mode** (`startProcessing('image')`) — a three-phase pipeline:
+  - **Phase 1a — Scrape ALL (unattended):** loops every ASIN and `prepareProduct`
+    scrapes dropy + gathers candidates from **Lens, Google Images, Pinterest, Amazon,
+    Bing, Reddit, Instagram** (each product's sources run in PARALLEL; products run
+    sequentially). No picking yet — you can step away. Buffered as `toPick[]`.
+  - **Phase 1b — Pick ALL (interactive):** once scraping is fully done, shows the
+    picker for each product back-to-back. Selections persist per-ASIN
+    (`csvBatchImage.pending`) so Stop/close doesn't force a re-pick.
   - **Phase 2 — Generation (unattended):** `generateProduct({…, mode:'image'})` hosts
     picked images on Shopify Files, then generates **exactly one review per hosted
     photo** (every review carries a photo) → **`<name>_images.csv`**.

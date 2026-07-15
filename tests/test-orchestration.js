@@ -21,8 +21,10 @@ globalThis.__t = {
     globalThis.__prepareCalls = [];
     globalThis.__pickCount = 0;
     globalThis.__genCount = 0;
+    globalThis.__seq = []; // order of scrape ('prep') vs pick ('pick') events
     prepareProduct = async (item, idx) => {
       globalThis.__prepareCalls.push(item.asin);
+      globalThis.__seq.push('prep');
       const s = (spec.prep && spec.prep[item.asin]) || {};
       if (s.skip) return { skip: true, error: s.error || 'not found on dropy.in' };
       return { productData: { name: 'P-' + item.asin, brand: '', lensText: '' }, candidates: s.candidates || [{url:'u',thumb:'t'}], refImg: '', refFull: '' };
@@ -47,6 +49,7 @@ globalThis.__t = {
     };
     pickImages = async (cands) => {
       globalThis.__pickCount++;
+      globalThis.__seq.push('pick');
       if (spec.stopAfterPick && globalThis.__pickCount >= spec.stopAfterPick) isProcessing = false;
       if (spec.pickEmpty) return []; // simulate the user picking NO photos
       return (cands || []).slice(0, 1);
@@ -60,6 +63,7 @@ globalThis.__t = {
     fileName: csvBatch ? csvFileName() : null,
     asins: csvBatch ? csvBatch.asins : null,
     pickCount: globalThis.__pickCount,
+    seq: globalThis.__seq ? globalThis.__seq.slice() : [],
   }),
 };
 `;
@@ -308,6 +312,16 @@ async function run() {
   await T.startProcessing('text');
   globalThis.__forceRegen = false;
   eq(T.snap().rows, ['r:A:0', 'r:B:0', 'r:B:1', 'r:C:0'], 'F2 B regenerated (replaced with 2 rows), A&C preserved');
+
+  // F6 image mode scrapes ALL products BEFORE any picking (scrape-all → pick-all)
+  resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({});
+  await T.startProcessing('image');
+  const seq = T.snap().seq;
+  const lastPrep = seq.lastIndexOf('prep');
+  const firstPick = seq.indexOf('pick');
+  ok(firstPick > -1 && lastPrep > -1 && lastPrep < firstPick, 'F6 all scraping happens before any picking');
+  eq(seq.filter((x) => x === 'prep').length, 3, 'F6 all 3 scraped');
+  eq(seq.filter((x) => x === 'pick').length, 3, 'F6 all 3 picked');
 
   // F3 total image count is stamped into the image filename
   resetStore(); T.setFileBase('cerave'); T.setProducts(P('A', 'B')); T.install({ imagesFor: { A: 3, B: 2 } });
