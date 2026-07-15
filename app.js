@@ -841,10 +841,12 @@ async function startProcessing(mode) {
       renderMetrics();
       continue;
     }
-    // Free the heaviest captured bytes we no longer need (the padded Lens SEARCH
-    // image); keep the candidates + gallery for the picker.
-    delete data.productData.imageData;
-    delete data.productData.image;
+    // Scrape-all buffers EVERY product until you pick, so keep the buffer LIGHT:
+    // free productData's captured bytes, and swap any gallery candidate's base64 for
+    // its cdn.shopify.com URL (which displays in the picker and hosts fine). Without
+    // this a large list would hold hundreds of MB of base64 across the pick phase.
+    ['gallery', 'imageData', 'images', 'originalImages', 'image'].forEach((key) => { delete data.productData[key]; });
+    (data.candidates || []).forEach((c) => { if (c.dataUrl && c.url) { c.thumb = c.url; c.dataUrl = ''; } });
     toPick.push({ item, i, data });
     updateAsinRow(i, 'queued', data.productData.name, `${data.candidates.length} candidate(s) — ready to pick`);
   }
@@ -871,6 +873,10 @@ async function startProcessing(mode) {
       const discarded = data.candidates.length - selected.length;
       log(`${selected.length} image(s) selected → will upload · ${discarded} unselected discarded (not uploaded, no trace)`, selected.length ? 'success' : 'info');
     }
+    // If STOP was pressed during this pick (isProcessing went false), discard this
+    // product's selection — do NOT finalize it as "no photos". Resume re-offers its
+    // picker. (Skip-images keeps isProcessing true, so a deliberate skip still saves.)
+    if (!isProcessing) { log('Stopped during selection', 'warn'); break; }
     // Free the heavy captured image data before buffering for Phase 2.
     ['gallery', 'imageData', 'images', 'originalImages', 'image'].forEach((key) => { delete data.productData[key]; });
 
@@ -1011,9 +1017,10 @@ async function recoverGemini() {
   return !!geminiTabId;
 }
 
-// PHASE 1 helper: scrape the product on dropy.in and gather review-image
-// candidates. No text generation and no user interaction, so it is safe to run
-// AHEAD of time (prefetch) while the user picks the previous product's images.
+// Scrape helper: look up the product on dropy.in and gather review-image
+// candidates. No text generation and no user interaction — image mode calls this
+// for EVERY product in Phase 1a (scrape-all) before any picking; text mode calls it
+// with textOnly=true (dropy lookup only, no image search).
 // Returns { productData, candidates, refImg, refFull } or { skip:true, error }.
 async function prepareProduct(item, productIndex, textOnly = false) {
   const asin = item.asin;

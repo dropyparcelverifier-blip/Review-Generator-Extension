@@ -155,6 +155,8 @@ async function run() {
   s = T.snap();
   eq(s.rows, [], 'S4 stop-in-selection: nothing generated');
   ok(!localStore.doneAsinsImage || localStore.doneAsinsImage.length === 0, 'S4 nothing marked done');
+  ok(localStore.csvBatchImage.pending && localStore.csvBatchImage.pending.A, 'S4 completed pick (A) saved');
+  ok(!localStore.csvBatchImage.pending.B, 'S4 Stop-interrupted pick (B) NOT saved -> re-pick on resume');
 
   // S5 stop DURING generation (after 1) -> that one saved+done, rest not
   resetStore(); T.setProducts(P('A', 'B', 'C')); T.install({ stopAfterGen: 1 });
