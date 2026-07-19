@@ -119,6 +119,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     } catch (e) {
       sendResponse({ error: e.message });
     }
+    return true; // async response for extract_product only — keep the channel open
   }
-  return true;
+  // Other actions: no response, so don't hold the channel open (return undefined).
 });

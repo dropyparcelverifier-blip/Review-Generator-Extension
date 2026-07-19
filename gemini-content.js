@@ -149,6 +149,27 @@ function findSendButton() {
   return null;
 }
 
+// A finished JSON array must have BALANCED brackets, not merely end in ']'. We scan
+// from the first '[' tracking string state, so a ']' inside a review body (e.g.
+// "Great value [5/5]") during a mid-stream stall does NOT look complete — preventing
+// a truncated response from being accepted as done.
+function jsonArrayLooksComplete(text) {
+  const t = (text || '').trim();
+  const start = t.indexOf('[');
+  if (start < 0 || !/\][\s`]*$/.test(t)) return false; // must contain and end at a ]
+  let depth = 0, inStr = false, esc = false, closed = false;
+  for (let i = start; i < t.length; i++) {
+    const c = t[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '[' || c === '{') depth++;
+    else if (c === ']' || c === '}') { depth--; if (depth === 0) closed = true; }
+  }
+  return closed && depth === 0 && !inStr; // top-level array fully balanced & closed
+}
+
 async function waitForResponse(timeout = 120000, baselineText = '') {
   // Wait for the response to start generating
   await sleep(1500);
@@ -186,10 +207,10 @@ async function waitForResponse(timeout = 120000, baselineText = '') {
       lastChange = Date.now();
     } else if (currentText) {
       const stableFor = Date.now() - lastChange;
-      const looksComplete = /\][\s`]*$/.test(currentText.trim()); // JSON array closed
-      // Fast path: response is a finished JSON array. This is the reliable
-      // signal and avoids waiting on flaky DOM "stop button" detection.
-      if (looksComplete && stableFor >= JSON_STABLE_MS) {
+      // Fast path: a BALANCED JSON array that stopped growing. Bracket-balance (not
+      // "ends in ]") avoids returning a truncated array when the stream stalls right
+      // after a ] inside a review body.
+      if (jsonArrayLooksComplete(currentText) && stableFor >= JSON_STABLE_MS) {
         return currentText;
       }
       // Generic fallback: stable a while AND no visible Stop button.
