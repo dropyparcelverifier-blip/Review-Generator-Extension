@@ -676,21 +676,24 @@ async function startProcessing(mode) {
   buildAsinTable(products);
   startTimer();
 
-  // Build the work list, skipping ASINs already completed in a previous run —
-  // UNLESS "regenerate already-done" is on, in which case done ASINs are reprocessed
-  // and their rows are REPLACED in the file (setCsvProduct), not duplicated.
+  // Build the work list, skipping ASINs already completed — but ONLY when this file's
+  // batch was resumed (its rows are actually present). On a fresh batch the rows are
+  // gone, so a globally-"done" ASIN must be regenerated or it'd be missing from the
+  // file. "Regenerate already-done" also forces reprocessing (rows REPLACED, not dup).
   const forceRegen = !!(document.getElementById('forceRegen') && document.getElementById('forceRegen').checked);
+  const canSkipDone = csvBatch.resumed && !forceRegen;
   const todo = [];
   for (let i = 0; i < totalProducts; i++) {
     const item = products[i];
-    if (doneAsins.has(item.asin) && !forceRegen) {
+    if (doneAsins.has(item.asin) && canSkipDone) {
       updateAsinRow(i, 'done', item.asin, 'already done');
       log(`Skipping ${item.asin} — already done in a previous run`, 'info');
       results.push({ asin: item.asin, sku: item.sku, name: item.asin, reviews: 0, images: 0, alreadyDone: true });
       stats.done++;
       renderMetrics();
     } else {
-      if (doneAsins.has(item.asin)) log(`Regenerating ${item.asin} — overwriting its earlier reviews`, 'info');
+      if (doneAsins.has(item.asin) && forceRegen) log(`Regenerating ${item.asin} — overwriting its earlier reviews`, 'info');
+      else if (doneAsins.has(item.asin)) log(`${item.asin} was done in another file — generating it for this one`, 'info');
       todo.push({ item, i });
     }
   }
@@ -1637,35 +1640,27 @@ function parseGeminiResponse(rawText) {
   
   jsonStr = jsonStr.substring(startIdx, endIdx + 1);
 
-  // Clean up common issues
-  jsonStr = jsonStr
-    .replace(/,\s*]/g, ']')  // trailing commas
-    .replace(/,\s*}/g, '}'); // trailing commas in objects
-
-  // Escape control chars (newlines/tabs) ONLY when they appear inside a
-  // string literal. Structural whitespace between tokens must be left as-is,
-  // otherwise pretty-printed JSON gets corrupted (e.g. "[\n {" -> "[\\n {").
+  // Escape control chars (newlines/tabs) ONLY when they appear inside a string
+  // literal. Structural whitespace between tokens is left as-is.
   jsonStr = escapeControlCharsInStrings(jsonStr);
 
+  // Parse the clean JSON FIRST, without pre-mutating it. The old trailing-comma
+  // regexes ran on the whole string and weren't string-aware, so a review body like
+  // "loved it, } best" had its comma deleted. Cleanup now runs ONLY as a fallback on
+  // already-malformed JSON, where a rare in-string edit can't corrupt a valid answer.
   try {
     const parsed = JSON.parse(jsonStr);
-    if (Array.isArray(parsed)) {
-      return normalizeReviews(parsed);
-    }
+    if (Array.isArray(parsed)) return normalizeReviews(parsed);
   } catch (e) {
-    // Try fixing common JSON issues
-    try {
-      // Sometimes Gemini adds trailing text
-      const fixedJson = jsonStr.replace(/\}[^}\]]*$/, '}]');
-      const parsed = JSON.parse(fixedJson);
-      if (Array.isArray(parsed)) {
-        return normalizeReviews(parsed);
-      }
-    } catch (e2) {
-      console.error('JSON parse failed:', e2.message);
+    const attempts = [
+      jsonStr.replace(/,\s*]/g, ']').replace(/,\s*}/g, '}'), // trailing commas
+      jsonStr.replace(/\}[^}\]]*$/, '}]'),                    // trailing junk after the last }
+    ];
+    for (const attempt of attempts) {
+      try { const p = JSON.parse(attempt); if (Array.isArray(p)) return normalizeReviews(p); } catch (e2) { /* next */ }
     }
+    console.error('JSON parse failed');
   }
-  
   return null;
 }
 
@@ -2312,6 +2307,12 @@ async function prepareBatch(mode, productList) {
   const isSubset = persisted && Array.isArray(persisted.asins) && productList.every((p) => persisted.asins.includes(p.asin));
   const sameFile = persisted && persistedBase && uploadedFileBase && persistedBase === base;
   const b = (persisted && (isSubset || sameFile)) ? persisted : { base, asins: productList.map((p) => p.asin) };
+  // `resumed` = we loaded an existing batch for THIS file (its rows are here). On a
+  // FRESH batch (a new/renamed list, or after a different list overwrote this mode's
+  // single storage slot) the prior rows are gone — so the todo loop must REGENERATE
+  // this file's ASINs even if they're globally "done", or the output would be missing
+  // the already-generated ones.
+  b.resumed = !!(persisted && (isSubset || sameFile));
   b.key = key;
   b.isImage = (mode === 'image');
   migrateBatch(b);

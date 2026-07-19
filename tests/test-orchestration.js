@@ -355,8 +355,9 @@ async function run() {
   eq(T.snap().rows, ['old:X', 'r:C:0'], 'F4 regenerated C not duplicated (legacy __prior row purged)');
   T.setFileBase('');
 
-  // F5 a DIFFERENT list that merely SHARES one ASIN must start its OWN fresh batch —
-  // never merge the other list's product in or clobber its file (the MEDIUM bug).
+  // F5 a DIFFERENT list that merely SHARES one ASIN starts its OWN fresh batch/file —
+  // it generates its OWN full product set (no other list's product leaks in, and the
+  // shared ASIN is regenerated for THIS file rather than skipped as globally-done).
   resetStore(); T.setFileBase('lista'); T.setProducts(P('X', 'Y')); T.install({});
   await T.startProcessing('text');
   eq(T.snap().rows, ['r:X:0', 'r:Y:0'], 'F5 list A = X,Y');
@@ -364,7 +365,21 @@ async function run() {
   await T.startProcessing('text');
   const s5 = T.snap();
   eq(s5.fileName, 'listb.csv', 'F5 list B writes its OWN file');
-  eq(s5.rows, ['r:Z:0'], 'F5 list B is fresh — list A\'s X did NOT leak in');
+  eq(s5.rows, ['r:Y:0', 'r:Z:0'], 'F5 list B is fresh -> its full set [Y,Z] (X did NOT leak in; Y regenerated for this file)');
+  T.setFileBase('');
+
+  // F8 running a DIFFERENT list overwrites this mode's single batch slot; re-running
+  // the FIRST list must REGENERATE it (fresh batch) so its file isn't left empty.
+  resetStore(); T.setFileBase('lista'); T.setProducts(P('a1', 'a2', 'a3')); T.install({});
+  await T.startProcessing('text');
+  eq(T.snap().rows, ['r:a1:0', 'r:a2:0', 'r:a3:0'], 'F8 list A generated');
+  T.resetState(); T.setFileBase('listb'); T.setProducts(P('b1', 'b2')); T.install({});
+  await T.startProcessing('text'); // overwrites the csvBatch slot with list B
+  T.resetState(); T.setFileBase('lista'); T.setProducts(P('a1', 'a2', 'a3')); T.install({});
+  await T.startProcessing('text'); // re-run A: slot was overwritten, must regenerate
+  const s8 = T.snap();
+  eq(s8.fileName, 'lista.csv', 'F8 re-run A targets lista.csv');
+  eq(s8.rows, ['r:a1:0', 'r:a2:0', 'r:a3:0'], 'F8 re-run A regenerates ALL (no data loss from the overwritten slot)');
   T.setFileBase('');
 
   // ============================================================

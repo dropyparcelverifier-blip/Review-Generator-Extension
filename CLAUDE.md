@@ -73,10 +73,14 @@ JSON fetched by the dropy handle in `dropy_lookup` (the store reuses dropy's han
   image selections by ASIN (image mode only). Persisted after each product (crash-safe);
   an ASIN is marked done only after rows persist. Legacy flat `rows`/`fileName` are
   migrated on load (`migrateBatch`). The active mode's key is `doneStoreKey()`/`csvStoreKey()`.
-- **Resume identity (`base`):** a run resumes the SAME batch if it targets the same
-  output `base` OR shares any ASIN — so a rerun (even of just the failed ASIN, even after
-  you deleted the file) MERGES instead of overwriting. The **Regenerate already-done**
-  checkbox (`forceRegen`) reprocesses done ASINs and replaces their rows.
+- **Resume identity (`base`):** a run resumes the SAME batch (`prepareBatch`) only if it
+  targets the same output `base` OR is a SUBSET of the persisted batch's ASINs (a rerun/
+  Retry) — so a rerun MERGES instead of overwriting, but an unrelated list gets its own
+  fresh batch/file. `batch.resumed` records this; **done-ASINs are skipped only on a
+  resumed batch** — on a fresh batch (new/renamed list, or after a different list
+  overwrote this mode's single storage slot) globally-done ASINs are REGENERATED so the
+  file is never left missing them. The **Regenerate already-done** checkbox (`forceRegen`)
+  reprocesses done ASINs and replaces their rows.
 - **Filename** is derived (`csvFileName`): `<base>.csv`, or image mode `<base>_<N>photos.csv`
   where N is the total photo count. When N changes the old file is erased (`erase_download`)
   so it stays ONE file. `lastDownloadId` tracks the file to erase.
