@@ -87,19 +87,23 @@ async function uploadToShopifyFiles(blob, filename) {
     throw new Error('fileCreate: ' + JSON.stringify(errs));
   }
 
-  // 4) Poll until the CDN URL is ready (file processing is async)
+  // 4) Poll until the CDN URL is ready (file processing is async). The file already
+  // EXISTS on the store now, so any throw here must carry its id (e.fileId) or the
+  // caller can't clean it up → orphan.
   let url = (file.image && file.image.url) || (file.preview && file.preview.image && file.preview.image.url) || '';
   const nodeQ = `query($id:ID!){node(id:$id){... on MediaImage{fileStatus image{url} preview{image{url}}}}}`;
-  for (let i = 0; i < 12 && !url; i++) {
-    await new Promise((r) => setTimeout(r, 1500));
-    const q = await shopifyGraphql(nodeQ, { id: file.id });
-    const node = q && q.data && q.data.node;
-    if (node) {
-      url = (node.image && node.image.url) || (node.preview && node.preview.image && node.preview.image.url) || '';
-      if (node.fileStatus === 'FAILED') throw new Error('file processing FAILED');
+  try {
+    for (let i = 0; i < 12 && !url; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const q = await shopifyGraphql(nodeQ, { id: file.id });
+      const node = q && q.data && q.data.node;
+      if (node) {
+        url = (node.image && node.image.url) || (node.preview && node.preview.image && node.preview.image.url) || '';
+        if (node.fileStatus === 'FAILED') throw new Error('file processing FAILED');
+      }
     }
-  }
-  return { url, id: file.id };
+  } catch (e) { if (!e.fileId) e.fileId = file.id; throw e; }
+  return { url, id: file.id }; // url may be '' (poll exhausted) — caller tracks id for cleanup
 }
 
 // Hosts an image on Shopify Files by handing Shopify the SOURCE URL and letting
@@ -114,18 +118,21 @@ async function hostShopifyFileByUrl(sourceUrl) {
     const errs = (created && created.data && created.data.fileCreate && created.data.fileCreate.userErrors) || (created && created.errors) || 'unknown';
     throw new Error('fileCreate(url): ' + JSON.stringify(errs));
   }
-  // Poll until the CDN URL is ready — Shopify fetches + processes asynchronously.
+  // Poll until the CDN URL is ready — Shopify fetches + processes asynchronously. Any
+  // throw here must carry the created file id (e.fileId) so the caller can clean it up.
   let url = (file.image && file.image.url) || (file.preview && file.preview.image && file.preview.image.url) || '';
   const nodeQ = `query($id:ID!){node(id:$id){... on MediaImage{fileStatus image{url} preview{image{url}}}}}`;
-  for (let i = 0; i < 15 && !url; i++) {
-    await new Promise((r) => setTimeout(r, 1500));
-    const q = await shopifyGraphql(nodeQ, { id: file.id });
-    const node = q && q.data && q.data.node;
-    if (node) {
-      url = (node.image && node.image.url) || (node.preview && node.preview.image && node.preview.image.url) || '';
-      if (node.fileStatus === 'FAILED') { const e = new Error('Shopify could not fetch the source image'); e.fileId = file.id; throw e; }
+  try {
+    for (let i = 0; i < 15 && !url; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const q = await shopifyGraphql(nodeQ, { id: file.id });
+      const node = q && q.data && q.data.node;
+      if (node) {
+        url = (node.image && node.image.url) || (node.preview && node.preview.image && node.preview.image.url) || '';
+        if (node.fileStatus === 'FAILED') throw new Error('Shopify could not fetch the source image');
+      }
     }
-  }
+  } catch (e) { if (!e.fileId) e.fileId = file.id; throw e; }
   // File exists but its URL isn't ready — surface the id so the caller can still
   // track it for cleanup (never leave an un-deletable orphan on the store).
   if (!url) { const e = new Error('Shopify file URL not ready (still processing)'); e.fileId = file.id; throw e; }
@@ -166,11 +173,14 @@ function persistScrapeTabs() {
   try { chrome.storage.session.set({ scrapeTabs: Array.from(scrapeTabs) }); } catch (e) {}
 }
 
-// Open a fresh background tab for one scrape.
+// Open a fresh background tab for one scrape. Resolves null if the tab can't be
+// created (e.g. tab-limit) so callers don't hang on an unresolved promise.
 async function openScrapeTab() {
   const id = await new Promise((resolve) => {
-    chrome.tabs.create({ url: 'about:blank', active: false }, (tab) => resolve(tab.id));
+    try { chrome.tabs.create({ url: 'about:blank', active: false }, (tab) => resolve(tab && tab.id != null ? tab.id : null)); }
+    catch (e) { resolve(null); }
   });
+  if (id == null) return null;
   scrapeTabs.add(id);
   persistScrapeTabs();
   return id;
@@ -199,6 +209,7 @@ function runInTab(url, injectFn, opts) {
   const timeout = (opts && opts.timeout) || 30000;
   return new Promise(async (resolve) => {
     const tabId = await openScrapeTab();
+    if (tabId == null) { resolve(null); return; } // couldn't open a tab — don't hang
     let done = false;
     const finish = (result) => {
       if (done) return;
@@ -298,12 +309,15 @@ async function findDropyProductByAsin(asin) {
         if (has(await hr.text())) return { url: p.url, matched: true, via: 'html' };
       } catch (e) { /* try next candidate */ }
     }
-    // No literal ASIN in the product data. Only trust the top result when dropy
-    // returned EXACTLY ONE candidate (unambiguous — e.g. predictive found one and
-    // full-text had 0). If there's a pile of fuzzy results (dropy doesn't actually
-    // carry this ASIN), flag it ⚠ so a wrong product isn't silently accepted.
+    // No literal ASIN anywhere in the product data. We could NOT verify the match, so
+    // return the top candidate but mark matched:false — the app flags it ⚠ unverified
+    // (and strictMatch can skip it) instead of silently trusting a possibly-wrong
+    // product. (A single candidate is unambiguous as "the only result", but "only
+    // result" is NOT the same as "confirmed this ASIN" — Shopify predictive search can
+    // fuzzy-match one wrong product.) `single` is surfaced so the app can soften the
+    // warning when there was exactly one candidate.
     const best = cands[0];
-    return { url: best.url, matched: cands.length === 1, via: best.predictive ? 'predictive' : 'search' };
+    return { url: best.url, matched: false, single: cands.length === 1, via: best.predictive ? 'predictive' : 'search' };
   } catch (e) {
     return challenged() ? { blocked: true } : { error: e.message };
   }
@@ -805,6 +819,7 @@ async function uploadReviewImages(sku, images) {
               if (!resp.ok) throw new Error('HTTP ' + resp.status);
               u = await uploadToShopifyFiles(await resp.blob(), name);
             } catch (e2) {
+              if (e2 && e2.fileId) createdIds.push(e2.fileId); // staged file created but poll failed
               fetchFails++; // neither Shopify nor we could fetch the image
             }
           }
@@ -813,6 +828,7 @@ async function uploadReviewImages(sku, images) {
         if (u && u.url) { urls.push(u.url); fileIds.push(u.id || ''); okCount++; }
         else { urls.push(it.url || ''); fileIds.push(''); }
       } catch (e) {
+        if (e && e.fileId) createdIds.push(e.fileId); // dataUrl staged file created but poll failed
         urls.push(it.url || ''); fileIds.push('');
       }
     }
@@ -1262,17 +1278,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === 'send_to_gemini') {
     keepAlive(true); // Gemini generation is long — keep the SW alive until it replies
+    // Guard: if the Gemini content script holds the channel open but never replies
+    // (generation wedged, tab frozen), settle ONCE after a timeout so the keepAlive
+    // ref is released (no permanent SW pin) and the app-side promise doesn't hang.
+    let settled = false;
+    const done = (resp) => { if (settled) return; settled = true; clearTimeout(guard); keepAlive(false); sendResponse(resp); };
+    const guard = setTimeout(() => done({ error: 'Gemini timed out (no response)' }), 150000);
     try {
       chrome.tabs.sendMessage(msg.tabId, {
         action: 'inject_prompt',
         prompt: msg.prompt
       }, (response) => {
-        keepAlive(false);
-        sendResponse(response || { error: chrome.runtime.lastError?.message || 'No response from Gemini' });
+        done(response || { error: chrome.runtime.lastError?.message || 'No response from Gemini' });
       });
     } catch (e) {
-      keepAlive(false); // sendMessage threw synchronously — release the ref, don't leak
-      sendResponse({ error: 'send failed: ' + e.message });
+      done({ error: 'send failed: ' + e.message }); // sendMessage threw synchronously
     }
     return true;
   }

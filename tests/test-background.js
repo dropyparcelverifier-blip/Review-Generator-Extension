@@ -151,7 +151,9 @@ function install({ dom = [], products = [], suggestOk = true, js = {}, html = {}
   res = await sandbox.findDropyProductByAsin('B09FRC4F1K');
   ok(res && res.matched === false, 'wrong fuzzy match (dropy lacks product) flagged unverified');
 
-  // Single clean candidate (predictive found one, full-text 0) -> trusted.
+  // Single candidate (predictive found one, full-text 0) but the ASIN is NOT in its
+  // data -> still picked, but flagged UNVERIFIED (matched:false) — "only result" is
+  // not "confirmed this ASIN". `single:true` lets the app soften the ⚠ message.
   install({
     title: 'Search: 0 results found', bodyText: 'No results found.',
     products: [{ handle: 'centrum-200', url: '/products/centrum-200' }], dom: [],
@@ -160,7 +162,7 @@ function install({ dom = [], products = [], suggestOk = true, js = {}, html = {}
   });
   res = await sandbox.findDropyProductByAsin('B09BVYY7XR');
   eq(res && res.url, '/products/centrum-200', 'sole predictive candidate -> picked');
-  ok(res && res.matched === true, 'sole unambiguous candidate -> trusted');
+  ok(res && res.matched === false && res.single === true, 'sole UNVERIFIED candidate -> flagged unverified (single)');
 
   // "0 results" page (Enter) but predictive box HAS the product: the recommended
   // /products/ links on the empty page must be ignored; predictive wins.
