@@ -20,6 +20,14 @@ function getProductJsonLd() {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'extract_product') {
     try {
+      // A Cloudflare challenge page has no product data — signal blocked instead of
+      // falling through to the name fallbacks and returning "Just a moment..." as a
+      // seemingly-valid product.
+      const pageTxt = ((document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 500) : '')).toLowerCase();
+      if (!getProductJsonLd() && /just a moment|checking your browser|cloudflare|cf-challenge|verify you are human|enable javascript and cookies|attention required/i.test(pageTxt)) {
+        sendResponse({ blocked: true, error: 'dropy.in is showing a Cloudflare check' });
+        return true;
+      }
       const data = {};
       const ld = getProductJsonLd();
 

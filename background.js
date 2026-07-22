@@ -219,8 +219,10 @@ function runInTab(url, injectFn, opts) {
       closeScrapeTab(tabId); // close as soon as the work is done — no accumulation
       resolve(result);
     };
-    function listener(tid, info) {
-      if (tid === tabId && info.status === 'complete') {
+    function listener(tid, info, t) {
+      // Ignore the initial about:blank 'complete' — only fire once the REAL target
+      // page finished loading (the tab object's url is no longer about:blank).
+      if (tid === tabId && info.status === 'complete' && t && t.url && !/^about:/i.test(t.url)) {
         chrome.tabs.onUpdated.removeListener(listener);
         setTimeout(() => {
           chrome.scripting.executeScript({ target: { tabId }, func: injectFn, args: (opts && opts.args) || [] }, (res) => {
@@ -745,6 +747,10 @@ function dataUrlToBlob(dataUrl) {
 async function lensSearchByBytes(dataUrl) {
   if (!dataUrl) return { images: [], text: '' };
 
+  // A search image may get CREATED on Shopify even when we can't use it (URL not
+  // ready / poll threw). Keep its id so the panel can still auto-clean it.
+  let strandedSearchId = null;
+
   // Preferred: public Shopify URL -> uploadbyurl
   if (SHOPIFY.domain && SHOPIFY.token) {
     try {
@@ -757,7 +763,8 @@ async function lensSearchByBytes(dataUrl) {
         // searchFileId lets the panel clean up this temporary search image later.
         return Object.assign({ images: [], text: '', resultUrl: lensUrl, via: 'shopify-url', searchFileId: uploaded.id }, scraped || {});
       }
-    } catch (e) { /* fall through to byte-upload */ }
+      if (uploaded && uploaded.id) strandedSearchId = uploaded.id; // created, URL not ready
+    } catch (e) { if (e && e.fileId) strandedSearchId = e.fileId; /* fall through to byte-upload */ }
   }
 
   // Fallback: raw byte-upload (often rate-limited / rejected by Google)
@@ -771,12 +778,12 @@ async function lensSearchByBytes(dataUrl) {
     });
     const resultUrl = resp.url || '';
     if (!resultUrl || !/google\.[^/]+\/search/i.test(resultUrl) || /\/searchbyimage\/upload/i.test(resultUrl)) {
-      return { images: [], text: '', resultUrl, error: 'byte-upload not accepted (configure Shopify for reliable Lens)' };
+      return { images: [], text: '', resultUrl, searchFileId: strandedSearchId || undefined, error: 'byte-upload not accepted (configure Shopify for reliable Lens)' };
     }
     const scraped = await runInTab(resultUrl, scrapeLensImages, { settle: 4500, timeout: 45000 });
-    return Object.assign({ images: [], text: '', resultUrl, via: 'byte-upload' }, scraped || {});
+    return Object.assign({ images: [], text: '', resultUrl, via: 'byte-upload', searchFileId: strandedSearchId || undefined }, scraped || {});
   } catch (e) {
-    return { images: [], text: '', error: e.message };
+    return { images: [], text: '', searchFileId: strandedSearchId || undefined, error: e.message };
   }
 }
 
@@ -949,14 +956,16 @@ function scrapeAmazonAcrossDomains(asin, domains, sendResponse) {
     const domain = domains[idx++];
     const url = `https://${domain}/dp/${asin}`;
     chrome.tabs.create({ url, active: false }, (tab) => {
+      if (chrome.runtime.lastError || !tab || tab.id == null) { tryNext(); return; } // tab failed -> next domain
       const tabId = tab.id;
+      scrapeTabs.add(tabId); persistScrapeTabs(); // tracked so a SW restart can still close it
       let settled = false;
       const finish = (result, retry) => {
         if (settled) return;
         settled = true;
         chrome.tabs.onUpdated.removeListener(listener);
         clearTimeout(guard);
-        try { chrome.tabs.remove(tabId); } catch (e) {}
+        closeScrapeTab(tabId);
         if (retry) tryNext();
         else sendResponse(result);
       };
@@ -1042,6 +1051,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === 'dropy_lookup') {
     (async () => {
+      keepAlive(true); // two+ sequential tab scrapes (~60s) — don't let the SW idle out
+      try {
       // Derive the clean ASIN (msg.asin, else parse it out of the query/SKU).
       const asin = msg.asin || (String(msg.query || '').match(/B0[A-Z0-9]{8}|\d{9}[\dX]/i) || [''])[0];
       const q = asin || msg.query;
@@ -1096,12 +1107,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch (e) { /* fall back to captured gallery */ }
 
       sendResponse(data);
+      } catch (e) {
+        sendResponse({ error: e.message || 'dropy lookup failed', name: '' });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
 
   if (msg.action === 'amazon_review_images') {
     (async () => {
+      keepAlive(true); // up to 2 domains × 35s of tab scraping
+      try {
       const domains = (msg.domains && msg.domains.length) ? msg.domains : ['www.amazon.in', 'www.amazon.com'];
       // Collect buyer photos from ALL marketplaces and merge — a US product (e.g.
       // One A Day) often has few/no review photos on .in but many on .com.
@@ -1117,54 +1133,82 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (all.length >= 30) break;
       }
       sendResponse({ images: all.slice(0, 30), source });
+      } catch (e) {
+        sendResponse({ images: [], source: '' });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
 
   if (msg.action === 'google_images') {
     (async () => {
-      if (!msg.query) { sendResponse({ images: [], ugc: 0 }); return; }
-      const url = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(msg.query)}`;
-      const scraped = await runInTab(url, scrapeLensImages, { settle: 3500, timeout: 40000 });
-      sendResponse(scraped || { images: [], ugc: 0 });
+      keepAlive(true);
+      try {
+        if (!msg.query) { sendResponse({ images: [], ugc: 0 }); return; }
+        const url = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(msg.query)}`;
+        const scraped = await runInTab(url, scrapeLensImages, { settle: 3500, timeout: 40000 });
+        sendResponse(scraped || { images: [], ugc: 0 });
+      } catch (e) {
+        sendResponse({ images: [], ugc: 0 });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
 
   if (msg.action === 'bing_images') {
     (async () => {
-      if (!msg.query) { sendResponse({ items: [], ugc: 0 }); return; }
-      const url = `https://www.bing.com/images/search?q=${encodeURIComponent(msg.query)}`;
-      const scraped = await runInTab(url, scrapeBingImages, { settle: 3000, timeout: 40000 });
-      sendResponse(scraped || { items: [], ugc: 0 });
+      keepAlive(true);
+      try {
+        if (!msg.query) { sendResponse({ items: [], ugc: 0 }); return; }
+        const url = `https://www.bing.com/images/search?q=${encodeURIComponent(msg.query)}`;
+        const scraped = await runInTab(url, scrapeBingImages, { settle: 3000, timeout: 40000 });
+        sendResponse(scraped || { items: [], ugc: 0 });
+      } catch (e) {
+        sendResponse({ items: [], ugc: 0 });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
 
   if (msg.action === 'lens_by_url') {
     (async () => {
-      if (!msg.imageUrl) { sendResponse({ images: [], text: '' }); return; }
-      const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(msg.imageUrl)}`;
-      const scraped = await runInTab(lensUrl, scrapeLensImages, { settle: 4500, timeout: 45000 });
-      sendResponse(Object.assign({ images: [], text: '', resultUrl: lensUrl, via: 'public-url' }, scraped || {}));
+      keepAlive(true);
+      try {
+        if (!msg.imageUrl) { sendResponse({ images: [], text: '' }); return; }
+        const lensUrl = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(msg.imageUrl)}`;
+        const scraped = await runInTab(lensUrl, scrapeLensImages, { settle: 4500, timeout: 45000 });
+        sendResponse(Object.assign({ images: [], text: '', resultUrl: lensUrl, via: 'public-url' }, scraped || {}));
+      } catch (e) {
+        sendResponse({ images: [], text: '' });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
 
   if (msg.action === 'lens_by_bytes') {
     (async () => {
-      const result = await lensSearchByBytes(msg.imageData);
-      sendResponse(result || { images: [], text: '' });
+      keepAlive(true);
+      try {
+        const result = await lensSearchByBytes(msg.imageData);
+        sendResponse(result || { images: [], text: '' });
+      } catch (e) {
+        sendResponse({ images: [], text: '' });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
 
   if (msg.action === 'lens_search') {
     (async () => {
-      if (!msg.imageUrl) { sendResponse({ images: [], text: '' }); return; }
-      const url = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(msg.imageUrl)}`;
-      const result = await runInTab(url, scrapeLensImages, { settle: 4000, timeout: 35000 });
-      sendResponse(result || { images: [], text: '' });
+      keepAlive(true);
+      try {
+        if (!msg.imageUrl) { sendResponse({ images: [], text: '' }); return; }
+        const url = `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(msg.imageUrl)}`;
+        const result = await runInTab(url, scrapeLensImages, { settle: 4000, timeout: 35000 });
+        sendResponse(result || { images: [], text: '' });
+      } catch (e) {
+        sendResponse({ images: [], text: '' });
+      } finally { keepAlive(false); }
     })();
     return true;
   }
@@ -1201,14 +1245,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === 'scrape_dropy') {
     chrome.tabs.create({ url: msg.url, active: false }, (tab) => {
+      if (chrome.runtime.lastError || !tab || tab.id == null) { sendResponse({ error: 'could not open tab' }); return; }
       const tabId = tab.id;
+      scrapeTabs.add(tabId); persistScrapeTabs(); // tracked so a SW restart can still close it
       let settled = false;
       const finish = (response) => {
         if (settled) return;
         settled = true;
         chrome.tabs.onUpdated.removeListener(listener);
         clearTimeout(guard);
-        try { chrome.tabs.remove(tabId); } catch (e) {}
+        closeScrapeTab(tabId);
         sendResponse(response);
       };
       function listener(tid, info) {
@@ -1232,14 +1278,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const query = encodeURIComponent(msg.query);
     const url = `https://www.google.com/search?q=${query}`;
     chrome.tabs.create({ url, active: false }, (tab) => {
+      if (chrome.runtime.lastError || !tab || tab.id == null) { sendResponse({ data: '' }); return; }
       const tabId = tab.id;
+      scrapeTabs.add(tabId); persistScrapeTabs(); // tracked so a SW restart can still close it
       let settled = false;
       const finish = (response) => {
         if (settled) return;
         settled = true;
         chrome.tabs.onUpdated.removeListener(listener);
         clearTimeout(guard);
-        try { chrome.tabs.remove(tabId); } catch (e) {}
+        closeScrapeTab(tabId);
         sendResponse(response);
       };
       function listener(tid, info) {
@@ -1271,6 +1319,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === 'open_gemini') {
     chrome.tabs.create({ url: 'https://gemini.google.com/app?hl=en-IN', active: false }, (tab) => {
+      if (chrome.runtime.lastError || !tab || tab.id == null) {
+        sendResponse({ error: chrome.runtime.lastError?.message || 'could not open Gemini tab' });
+        return;
+      }
       sendResponse({ tabId: tab.id });
     });
     return true;
