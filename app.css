@@ -312,6 +312,16 @@ code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px;
 .start-actions { display: flex; flex-direction: column; gap: 10px; }
 .start-hint { margin-top: 10px; }
 
+/* Direct Input/Output folders */
+.fs-folders { margin-bottom: 12px; padding: 10px 12px; border: 1px solid rgba(99,102,241,0.25); border-radius: 10px; background: rgba(99,102,241,0.06); display: flex; flex-direction: column; gap: 8px; }
+.fs-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.fs-row .btn-mini { flex: 0 0 auto; }
+.fs-row .hint { margin: 0; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.input-file-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.input-file-chip { padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(99,102,241,0.35); background: rgba(99,102,241,0.12); color: #a5b4fc; font-size: 12px; font-weight: 600; cursor: pointer; }
+.input-file-chip:hover { background: rgba(99,102,241,0.25); }
+.input-file-chip.active { background: #6366f1; color: #fff; border-color: #6366f1; }
+
 .btn-resume {
   width: 100%;
   padding: 12px;

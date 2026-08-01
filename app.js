@@ -273,6 +273,52 @@ fileInput.addEventListener('change', (e) => {
   if (e.target.files.length) handleFile(e.target.files[0]);
 });
 removeFile.addEventListener('click', resetUpload);
+
+// ---- Input/Output folders (File System Access) UI ----
+let selectedInputFile = ''; // name of the chosen list file in the input folder
+function setFolderStatus() {
+  const inEl = document.getElementById('inputFolderName');
+  const outEl = document.getElementById('outputFolderName');
+  if (inEl) inEl.textContent = inputDirHandle ? `📄 ${inputDirHandle.name}` : 'not set';
+  if (outEl) outEl.textContent = outputDirHandle ? `✅ ${outputDirHandle.name} — CSVs write here directly` : 'not set — CSVs download to your Downloads folder';
+}
+async function renderInputFiles() {
+  const box = document.getElementById('inputFileList');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!inputDirHandle) return;
+  const files = await listInputFiles();
+  if (!files.length) { box.innerHTML = '<span class="hint">No .txt/.csv/.xlsx files in this folder.</span>'; return; }
+  files.forEach((name) => {
+    const chip = document.createElement('button');
+    chip.className = 'input-file-chip' + (name === selectedInputFile ? ' active' : '');
+    chip.textContent = name;
+    chip.addEventListener('click', async () => {
+      try {
+        selectedInputFile = name;
+        renderInputFiles();
+        const file = await readInputFile(name);
+        handleFile(file); // same path as an uploaded file
+      } catch (e) { alert('Could not read ' + name + ': ' + e.message); }
+    });
+    box.appendChild(chip);
+  });
+}
+async function initFolders() {
+  const wrap = document.getElementById('fsFolders');
+  if (!FS_SUPPORTED) { if (wrap) wrap.classList.add('hidden'); return; } // fall back to upload/download
+  if (wrap) wrap.classList.remove('hidden');
+  inputDirHandle = await fsGetHandle('input');
+  outputDirHandle = await fsGetHandle('output');
+  setFolderStatus();
+  if (inputDirHandle) renderInputFiles();
+  const pin = document.getElementById('pickInputBtn');
+  if (pin) pin.addEventListener('click', async () => { try { await pickInputFolder(); selectedInputFile = ''; setFolderStatus(); renderInputFiles(); } catch (e) { /* user cancelled */ } });
+  const pout = document.getElementById('pickOutputBtn');
+  if (pout) pout.addEventListener('click', async () => { try { await pickOutputFolder(); setFolderStatus(); } catch (e) { /* cancelled */ } });
+  const ref = document.getElementById('refreshInputBtn');
+  if (ref) ref.addEventListener('click', renderInputFiles);
+}
 startTextBtn.addEventListener('click', () => startProcessing('text'));
 startImageBtn.addEventListener('click', () => startProcessing('image'));
 
@@ -1734,26 +1780,95 @@ function buildCsvRows(reviews, product, imageItems) {
   ].join(','));
 }
 
-// Writes ONE CSV file containing all rows accumulated across the run.
-// Resolves TRUE only if the file was actually written (save_file OK, or the Blob
-// fallback completed) — so callers never mark `written` when the write failed.
+// ============================================================
+// FILE SYSTEM ACCESS — optional Input/Output folders (direct read/write, no
+// upload dialog / no download). Falls back to file-upload + chrome.downloads when
+// no folder is chosen or the API is unavailable. Handles persist in IndexedDB.
+// ============================================================
+let inputDirHandle = null;   // FileSystemDirectoryHandle (read)
+let outputDirHandle = null;  // FileSystemDirectoryHandle (readwrite)
+const FS_SUPPORTED = (typeof window !== 'undefined') && ('showDirectoryPicker' in window);
+
+function fsIdb() {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open('rg-fs', 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore('handles'); };
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function fsPutHandle(key, handle) {
+  try { const db = await fsIdb(); await new Promise((res) => { const tx = db.transaction('handles', 'readwrite'); tx.objectStore('handles').put(handle, key); tx.oncomplete = res; tx.onerror = res; }); } catch (e) {}
+}
+async function fsGetHandle(key) {
+  try { const db = await fsIdb(); return await new Promise((res) => { const tx = db.transaction('handles', 'readonly'); const g = tx.objectStore('handles').get(key); g.onsuccess = () => res(g.result || null); g.onerror = () => res(null); }); } catch (e) { return null; }
+}
+// Ensure we still have permission for a persisted handle (Chrome may drop it across
+// browser restarts — a single click re-grants). `interactive` allows the prompt.
+async function fsPermission(handle, mode, interactive) {
+  if (!handle) return false;
+  const opts = { mode };
+  try {
+    if ((await handle.queryPermission(opts)) === 'granted') return true;
+    if (interactive && (await handle.requestPermission(opts)) === 'granted') return true;
+  } catch (e) {}
+  return false;
+}
+async function pickInputFolder() {
+  inputDirHandle = await window.showDirectoryPicker({ id: 'rg-input', mode: 'read' });
+  await fsPutHandle('input', inputDirHandle);
+  return inputDirHandle;
+}
+async function pickOutputFolder() {
+  outputDirHandle = await window.showDirectoryPicker({ id: 'rg-output', mode: 'readwrite' });
+  await fsPutHandle('output', outputDirHandle);
+  return outputDirHandle;
+}
+async function listInputFiles() {
+  if (!inputDirHandle || !(await fsPermission(inputDirHandle, 'read', true))) return [];
+  const out = [];
+  try { for await (const [name, h] of inputDirHandle.entries()) { if (h.kind === 'file' && /\.(txt|csv|xlsx?)$/i.test(name)) out.push(name); } } catch (e) {}
+  return out.sort();
+}
+async function readInputFile(name) {
+  const fh = await inputDirHandle.getFileHandle(name);
+  return fh.getFile(); // a File object — same shape handleFile() already consumes
+}
+// Writes text to <name> in the Output folder (create/overwrite). Returns true on success.
+async function writeOutputFile(name, text) {
+  if (!outputDirHandle || !(await fsPermission(outputDirHandle, 'readwrite', false))) return false;
+  try {
+    const fh = await outputDirHandle.getFileHandle(name, { create: true });
+    const w = await fh.createWritable();
+    await w.write(text);
+    await w.close();
+    return true;
+  } catch (e) { return false; }
+}
+async function deleteOutputFile(name) {
+  if (!outputDirHandle || !name) return;
+  try { await outputDirHandle.removeEntry(name); } catch (e) { /* already gone */ }
+}
+
+// Writes ONE CSV file. Resolves { ok, downloadId, folder }: writes DIRECTLY to the
+// chosen Output folder when set (folder:true, no download); otherwise the silent
+// chrome.downloads path (with a Blob fallback). `ok` is true only on a real write.
 function writeCombinedCsv(rows, fileName) {
   const csv = [CSV_HEADERS.join(',')].concat(rows).join('\r\n');
   return new Promise((resolve) => {
-    // Save silently via chrome.downloads (saveAs:false) — no "Save As" prompt.
-    // UTF-8 data URL keeps any emojis intact. Falls back to a Blob download.
-    try {
-      const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
-      // overwrite (not uniquify) so resuming a batch keeps ONE file, not copies.
-      chrome.runtime.sendMessage({ action: 'save_file', filename: fileName, dataUrl, conflictAction: 'overwrite' }, (resp) => {
-        if (chrome.runtime.lastError || !resp || !resp.ok) {
-          resolve({ ok: downloadCsvFallback(csv, fileName), downloadId: null });
-        } else {
-          resolve({ ok: true, downloadId: (resp.downloadId != null ? resp.downloadId : null) });
-        }
-      });
-    } catch (e) {
-      resolve({ ok: downloadCsvFallback(csv, fileName), downloadId: null });
+    const downloadPath = () => {
+      try {
+        const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+        chrome.runtime.sendMessage({ action: 'save_file', filename: fileName, dataUrl, conflictAction: 'overwrite' }, (resp) => {
+          if (chrome.runtime.lastError || !resp || !resp.ok) resolve({ ok: downloadCsvFallback(csv, fileName), downloadId: null });
+          else resolve({ ok: true, downloadId: (resp.downloadId != null ? resp.downloadId : null) });
+        });
+      } catch (e) { resolve({ ok: downloadCsvFallback(csv, fileName), downloadId: null }); }
+    };
+    if (outputDirHandle) {
+      writeOutputFile(fileName, csv).then((ok) => { if (ok) resolve({ ok: true, downloadId: null, folder: true }); else downloadPath(); }).catch(downloadPath);
+    } else {
+      downloadPath();
     }
   });
 }
@@ -2248,10 +2363,14 @@ async function writeCsvNow() {
   const res = await writeCombinedCsv(csvAllRows(), name);
   if (res && res.ok) {
     csvBatch.written = true;
-    if (csvBatch.lastFile && csvBatch.lastFile !== name && csvBatch.lastDownloadId != null) {
-      try { chrome.runtime.sendMessage({ action: 'erase_download', id: csvBatch.lastDownloadId }); } catch (e) {}
+    // Name changed (image count grew) — remove the previous file so it stays ONE file.
+    // Folder mode: delete by name directly. Download mode: erase by download id.
+    if (csvBatch.lastFile && csvBatch.lastFile !== name) {
+      if (csvBatch.lastFolder) deleteOutputFile(csvBatch.lastFile);
+      else if (csvBatch.lastDownloadId != null) { try { chrome.runtime.sendMessage({ action: 'erase_download', id: csvBatch.lastDownloadId }); } catch (e) {} }
     }
     csvBatch.lastFile = name;
+    csvBatch.lastFolder = !!res.folder;
     if (res.downloadId != null) csvBatch.lastDownloadId = res.downloadId;
   }
   return !!(res && res.ok);
@@ -2343,5 +2462,6 @@ function initDashboard() {
   const dr = document.getElementById('deleteReviewBtn');
   if (dr) dr.addEventListener('click', deleteReviewImages);
   updateUploadedUi();
+  try { initFolders(); } catch (e) { /* File System Access optional */ }
 }
 initDashboard();

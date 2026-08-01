@@ -101,6 +101,14 @@ JSON fetched by the dropy handle in `dropy_lookup` (the store reuses dropy's han
 `conflictAction`), `delete_shopify_files`, `close_scrape_tab`.
 
 ## Notable behaviors
+- **Optional Input/Output folders (File System Access):** the upload screen can bind an
+  Input folder (read ASIN lists directly — click a file chip instead of the file dialog)
+  and an Output folder (CSVs written straight there, no download). Handles persist in
+  IndexedDB (`fsPutHandle`/`fsGetHandle`); Chrome may need a one-click re-grant per
+  browser session (`fsPermission`). `writeCombinedCsv` writes to `outputDirHandle` when
+  set (`folder:true`), else the `save_file`/download path; the counted-name erase deletes
+  by name in folder mode (`deleteOutputFile`) vs `erase_download`. Falls back fully to
+  upload+download when no folder is chosen or the API is unavailable (`FS_SUPPORTED`).
 - **Scrape tabs** (`openScrapeTab`/`closeScrapeTab`/`closeAllScrapeTabs`): each
   `runInTab` opens its own background tab and **closes it the moment the scrape
   finishes**, so tabs never accumulate; concurrent calls are what make sources run
@@ -151,5 +159,6 @@ those in a real browser.
   succeeded — so a logged-out unattended run doesn't grind out an empty CSV.
 - Files are `app.*` (renamed from `sidepanel.*`). `background.js` opens `app.html`.
 - Git shows harmless `LF will be replaced by CRLF` warnings on Windows.
-- End commit messages with the `Co-Authored-By: Claude` trailer; branch off `main`
-  before committing if asked to commit.
+- Commits are authored by **sagar21-creator** (git user.email is that account's noreply
+  address) and must NOT include a `Co-Authored-By: Claude` trailer (owner's preference).
+  Branch off `main` before committing if asked to commit.

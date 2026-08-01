@@ -33,6 +33,20 @@
           <span class="step-num">1</span>
           <h2>Upload ASIN List</h2>
         </div>
+        <!-- Direct folders (optional): read lists from an Input folder, write CSVs to an Output folder — no upload/download -->
+        <div class="fs-folders hidden" id="fsFolders">
+          <div class="fs-row">
+            <button class="btn-mini" id="pickInputBtn">📂 Input folder</button>
+            <span class="hint" id="inputFolderName">not set</span>
+            <button class="btn-mini" id="refreshInputBtn" title="Rescan the input folder">↻</button>
+          </div>
+          <div class="fs-row">
+            <button class="btn-mini" id="pickOutputBtn">📁 Output folder</button>
+            <span class="hint" id="outputFolderName">not set — CSVs download to your Downloads folder</span>
+          </div>
+          <div id="inputFileList" class="input-file-list"></div>
+        </div>
+
         <div class="upload-zone" id="dropZone">
           <div class="upload-icon">📁</div>
           <p>Drop a <b>.txt / .csv / .xlsx</b> file here or <label for="fileInput" class="browse-link">browse</label></p>
