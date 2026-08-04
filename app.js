@@ -1371,7 +1371,7 @@ async function generateProduct(job) {
     if (uploadIdx.length) {
       updateProductStatus('Hosting selected images...', productName);
       log(`Hosting ${uploadIdx.length} image(s) on Shopify...`, 'info');
-      const up = await bg({ action: 'upload_images', sku, images: uploadIdx.map((i) => selected[i]) });
+      const up = await bg({ action: 'upload_images', sku, images: uploadIdx.map((i) => selected[i]), store: settings.store, customDomain: settings.customStoreDomain || '' });
       hosted = up.urls || [];
       // Track EVERY file we created on Shopify (incl. any created-but-stranded when
       // its URL wasn't ready) so cleanup can reach them all — never orphan a file.

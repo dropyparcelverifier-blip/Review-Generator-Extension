@@ -804,7 +804,7 @@ async function lensSearchByBytes(dataUrl) {
 // { url, dataUrl } (dataUrl = captured bytes when available). Returns { ok, urls }
 // where urls are PUBLIC hosted URLs (never data URLs). If not configured, returns
 // the original source URLs so the flow still works.
-async function uploadReviewImages(sku, images) {
+async function uploadReviewImages(sku, images, store, customDomain) {
   const items = (images || []).map((x) => (typeof x === 'string' ? { url: x, dataUrl: '' } : x));
   const sourceUrls = items.map((i) => i.url).filter(Boolean);
 
@@ -856,38 +856,66 @@ async function uploadReviewImages(sku, images) {
     return { ok: false, configured: true, via: 'shopify', error: 'Shopify upload returned no URLs', urls: sourceUrls, fileIds, createdFileIds: createdIds, hosted: 0, fetchFails };
   }
 
-  if (!DROPY_UPLOAD.endpoint) {
+  // If DROPY_UPLOAD is not configured, fall back to checking store-specific upload configs (e.g., RUDRA_UPLOAD)
+  const fallbackUpload = (items, sku, sourceUrls, store, customDomain) => null;
+
+  // Prefer store-specific upload when provided (e.g., RUDRA_UPLOAD)
+  // Resolve store-specific upload config safely. Prefer an explicit RUDRA_UPLOAD
+  // object if present, else fall back to ENV.RUDRA_UPLOAD (from config.js) and
+  // finally to the generic DROPY_UPLOAD. This avoids ReferenceError when
+  // RUDRA_UPLOAD isn't defined in the global scope.
+  const envRudra = (typeof ENV !== 'undefined' && ENV && ENV.RUDRA_UPLOAD) ? ENV.RUDRA_UPLOAD : null;
+  const storeUploadConfig = (store === 'rudra' && ((typeof RUDRA_UPLOAD !== 'undefined' && RUDRA_UPLOAD && RUDRA_UPLOAD.endpoint) || (envRudra && envRudra.endpoint)))
+    ? ((typeof RUDRA_UPLOAD !== 'undefined' && RUDRA_UPLOAD && RUDRA_UPLOAD.endpoint) ? RUDRA_UPLOAD : envRudra)
+    : null;
+  const activeUpload = storeUploadConfig || DROPY_UPLOAD;
+  if (!activeUpload || !activeUpload.endpoint) {
     return { ok: false, configured: false, urls: sourceUrls };
   }
+
   try {
-    if (DROPY_UPLOAD.mode === 'file') {
+    if (activeUpload.mode === 'file') {
       // Multipart: prefer captured bytes (dataUrl); else fetch the URL.
       const urls = [];
       for (const it of items) {
         let blob = null;
         if (it.dataUrl) blob = dataUrlToBlob(it.dataUrl);
-        else if (it.url) blob = await (await fetch(it.url)).blob();
-        if (!blob) continue;
+        else if (it.url) {
+          try { blob = await (await fetch(it.url)).blob(); } catch (e) { /* swallow */ }
+        }
+        if (!blob) {
+          // If unable to fetch the bytes, append original URL as fallback
+          urls.push(it.url || '');
+          continue;
+        }
         const fd = new FormData();
-        fd.append(DROPY_UPLOAD.skuField, sku);
-        fd.append(DROPY_UPLOAD.imageField, blob, 'review.jpg');
-        const r = await fetch(DROPY_UPLOAD.endpoint, {
-          method: DROPY_UPLOAD.method,
-          headers: DROPY_UPLOAD.authHeader ? { [DROPY_UPLOAD.authHeader]: DROPY_UPLOAD.authValue } : {},
+        fd.append(activeUpload.skuField || 'sku', sku);
+        fd.append(activeUpload.imageField || 'image', blob, 'review.jpg');
+        const r = await fetch(activeUpload.endpoint, {
+          method: activeUpload.method || 'POST',
+          headers: activeUpload.authHeader ? { [activeUpload.authHeader]: activeUpload.authValue } : {},
           body: fd
         });
         const j = await r.json().catch(() => ({}));
-        urls.push(j.url || j.location || it.url);
+        urls.push(j.url || j.location || it.url || '');
       }
       return { ok: true, configured: true, urls: urls.filter(Boolean) };
     }
 
     // url mode: send the image URLs as JSON, expect hosted URLs back.
     const headers = { 'Content-Type': 'application/json' };
-    if (DROPY_UPLOAD.authHeader) headers[DROPY_UPLOAD.authHeader] = DROPY_UPLOAD.authValue;
+    if (activeUpload.authHeader) headers[activeUpload.authHeader] = activeUpload.authValue;
     const body = {};
-    body[DROPY_UPLOAD.skuField] = sku;
-    body[DROPY_UPLOAD.imageField + 's'] = sourceUrls;
+    body[activeUpload.skuField || 'sku'] = sku;
+    body[(activeUpload.imageField || 'image') + 's'] = sourceUrls;
+    const resp = await fetch(activeUpload.endpoint, { method: activeUpload.method || 'POST', headers, body: JSON.stringify(body) });
+    const j = await resp.json().catch(() => ({}));
+    // Accept either { urls: [...] } or { url: '...' } or array directly
+    const urls = j.urls || j.images || (Array.isArray(j) ? j : (j.url ? [j.url] : []));
+    return { ok: true, configured: true, urls: urls.filter(Boolean) };
+  } catch (e) {
+    return { ok: false, configured: true, error: e.message, urls: sourceUrls };
+  }
     const r = await fetch(DROPY_UPLOAD.endpoint, { method: DROPY_UPLOAD.method, headers, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
     return { ok: true, configured: true, urls: j.urls || j.images || sourceUrls };
@@ -1252,7 +1280,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       keepAlive(true);
       try {
-        const result = await uploadReviewImages(msg.sku, msg.images || []);
+        const store = (msg && msg.store) ? msg.store : '';
+        const customDomain = (msg && msg.customDomain) ? msg.customDomain : '';
+        const result = await uploadReviewImages(msg.sku, msg.images || [], store, customDomain);
         sendResponse(result);
       } catch (e) {
         // Always answer so the channel never closes silently; fall back to source URLs.
