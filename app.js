@@ -318,6 +318,89 @@ async function initFolders() {
   if (pout) pout.addEventListener('click', async () => { try { await pickOutputFolder(); setFolderStatus(); } catch (e) { /* cancelled */ } });
   const ref = document.getElementById('refreshInputBtn');
   if (ref) ref.addEventListener('click', renderInputFiles);
+
+  // Process-all buttons: run every eligible list file in the input folder sequentially
+  const procAllText = document.getElementById('processAllTextBtn');
+  const procAllImage = document.getElementById('processAllImageBtn');
+  if (procAllText) procAllText.addEventListener('click', async () => { try { await processAllInputFiles('text'); } catch (e) { alert('Process-all failed: ' + e.message); } });
+  if (procAllImage) procAllImage.addEventListener('click', async () => { try { await processAllInputFiles('image'); } catch (e) { alert('Process-all failed: ' + e.message); } });
+
+  // storeSelect change handler to show custom domain input
+  const storeSel = document.getElementById('storeSelect');
+  if (storeSel) storeSel.addEventListener('change', () => {
+    const csr = document.getElementById('customStoreRow');
+    if (csr) csr.style.display = (storeSel.value === 'other') ? 'block' : 'none';
+  });
+}
+
+// Process every file in the input folder sequentially. Respects current settings
+// (batch size, mode-specific behavior). For each file the UI is updated and the
+// usual run path is used so CSV writing/flush behavior is unchanged. After each
+// file-run, if some SKUs failed, a single automatic retry is attempted.
+async function processAllInputFiles(mode) {
+  if (!FS_SUPPORTED) { alert('File System Access is not supported in this browser'); return; }
+  if (!inputDirHandle) { alert('No input folder selected — pick one first'); return; }
+  const files = await listInputFiles();
+  if (!files.length) { alert('No .txt/.csv/.xlsx files found in the input folder'); return; }
+
+  for (const name of files) {
+    selectedInputFile = name;
+    renderInputFiles();
+
+    // If configured, confirm before each file; otherwise run unattended
+    if (settings.confirmPerFile) {
+      if (!confirm(`Process file "${name}" as ${mode.toUpperCase()} run?\n\nClick Cancel to stop processing remaining files.`)) break;
+    } else {
+      log(`Processing file "${name}" as ${mode.toUpperCase()} run...`, 'info');
+    }
+
+    let file;
+    try {
+      file = await readInputFile(name);
+    } catch (e) {
+      log('Failed reading ' + name + ': ' + e.message, 'error');
+      continue; // skip to next file
+    }
+
+    // Reset per-file runtime state to avoid bleed between runs
+    resetUpload(); // clears products, UI upload state for a fresh run
+    handleFile(file); // prepares `products` and uploadedFileBase as usual
+
+    // Start the run and wait for it to finish. startProcessing is async and
+    // returns when the run completes (or stops). Use lastMode for retry logic.
+    lastMode = mode;
+    await startProcessing(mode);
+
+    // After the run, if there were failures, attempt configurable automatic retries
+    // of the failed SKUs (user still sees updates). Settings: settings.fileRetry
+    // controls maxRetries (number of extra attempts), base delay (seconds), and
+    // optionally exponential backoff between retries.
+    const fr = (settings && settings.fileRetry) ? settings.fileRetry : { maxRetries: 1, delaySec: 2, backoff: false };
+    if (lastFailed && lastFailed.length && fr.maxRetries > 0) {
+      let attempt = 0;
+      while (lastFailed && lastFailed.length && attempt < Number(fr.maxRetries || 0)) {
+        attempt++;
+        const retryItems = lastFailed.slice();
+        log(`File-level retry ${attempt}/${fr.maxRetries} for "${name}" — ${retryItems.length} SKU(s)...`, 'info');
+        // Re-run only the failed SKUs (keeps work focused and avoids redoing all)
+        products = retryItems.map((it) => ({ asin: it.asin, sku: it.sku }));
+        lastMode = mode;
+        await startProcessing(mode);
+        // If still failed and more attempts remain, wait with optional backoff
+        if (lastFailed && lastFailed.length && attempt < Number(fr.maxRetries || 0)) {
+          const delayMs = Math.max(0, Number(fr.delaySec || 2) * (fr.backoff ? Math.pow(2, attempt - 1) : 1)) * 1000;
+          log(`Waiting ${Math.round(delayMs/1000)}s before next file-level retry...`, 'info');
+          await sleep(delayMs);
+        }
+      }
+      if (lastFailed && lastFailed.length) log(`File-level retries exhausted for "${name}" — ${lastFailed.length} SKU(s) remain failed`, 'warn');
+    }
+
+    // Small pause between files so the SW and UI have time to settle
+    await sleep(1200);
+    // If user pressed Stop during the run, exit the process-all loop
+    if (!isProcessing) break;
+  }
 }
 startTextBtn.addEventListener('click', () => startProcessing('text'));
 startImageBtn.addEventListener('click', () => startProcessing('image'));
@@ -1045,14 +1128,20 @@ async function prepareProduct(item, productIndex, textOnly = false) {
 
   // Step 1: Find the product on dropy.in via predictive search matched to the
   // ASIN (background verifies the ASIN against candidates' product JSON).
-  log(`Looking up ${asin} on dropy.in...`, 'info');
+  const storeName = settings.store || 'dropy';
+  log(`Looking up ${asin} on ${storeName}...`, 'info');
 
   const productData = await new Promise((resolve) => {
-    chrome.runtime.sendMessage({ action: 'dropy_lookup', query: sku, asin }, (response) => resolve(response || {}));
+    if (!storeName || storeName === 'dropy') {
+      // preserve legacy dropy path for backwards compatibility and tests
+      chrome.runtime.sendMessage({ action: 'dropy_lookup', query: sku, asin }, (response) => resolve(response || {}));
+    } else {
+      chrome.runtime.sendMessage({ action: 'site_lookup', query: sku, asin, store: settings.store, customDomain: settings.customStoreDomain || '' }, (response) => resolve(response || {}));
+    }
   });
 
   if (!productData.name) {
-    return { skip: true, error: productData.error || 'not found on dropy.in' };
+    return { skip: true, error: productData.error || `not found on ${storeName}` };
   }
 
   const productName = productData.name;
@@ -1338,26 +1427,33 @@ async function generateProduct(job) {
   productData.webReference = [aiOverview, productData.lensText || ''].filter(Boolean).join('\n---\n').slice(0, 3000);
   log(aiOverview ? 'AI Overview collected' : 'No AI Overview (using Lens text)', aiOverview ? 'success' : 'warn');
 
-  // Step 6: Open Gemini (or reuse)
-  if (!geminiTabId) {
-    updateProductStatus('Opening Gemini...', productName);
-    log('Opening Gemini tab...', 'info');
-    
-    const geminiResult = await new Promise((resolve) => {
-      chrome.runtime.sendMessage({ action: 'open_gemini' }, resolve);
-    });
-    geminiTabId = geminiResult && geminiResult.tabId;
+  // Step 6: Open the configured AI provider tab (if using a web UI). If API mode is selected,
+  // no tab is opened — the background will POST to the configured API endpoint.
+  const provider = (settings && settings.aiProvider) ? settings.aiProvider : 'gemini';
+  if (provider !== 'api') {
     if (!geminiTabId) {
-      throw new Error('Could not open Gemini tab');
+      updateProductStatus(`Opening ${provider}...`, productName);
+      log(`Opening ${provider} tab...`, 'info');
+      const geminiResult = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ action: 'open_gemini', provider }, resolve);
+      });
+      geminiTabId = geminiResult && geminiResult.tabId;
+      if (!geminiTabId) {
+        throw new Error('Could not open AI tab');
+      }
+      await sleep(3000); // Wait for provider to load
+      log(`${provider} ready`, 'success');
+    } else {
+      // New chat/session for the provider
+      await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ action: 'new_gemini_chat', tabId: geminiTabId, provider }, resolve);
+      });
+      await sleep(2000);
     }
-    await sleep(3000); // Wait for Gemini to load
-    log('Gemini ready', 'success');
   } else {
-    // New chat for new product
-    await new Promise((resolve) => {
-      chrome.runtime.sendMessage({ action: 'new_gemini_chat', tabId: geminiTabId }, resolve);
-    });
-    await sleep(2000);
+    // API provider: do not open any tab; background will call API directly
+    geminiTabId = null;
+    log('Using API provider (no browser tab)', 'info');
   }
 
   // Step 4: Generate reviews in batches (count + batch size from Settings).
@@ -1403,45 +1499,53 @@ async function generateProduct(job) {
     let retries = 0;
     let batchReviews = null;
 
-    while (retries < 3 && !batchReviews) {
+    const maxRetries = (settings.retry && Number(settings.retry.maxRetries)) || 3;
+    const baseDelaySec = (settings.retry && Number(settings.retry.delaySec)) || 5;
+    const backoff = !!(settings.retry && settings.retry.backoff);
+
+    while (retries < maxRetries && !batchReviews) {
       try {
+        const providerMsg = { action: 'send_to_gemini', provider: provider, tabId: geminiTabId, prompt: prompt };
         const geminiResponse = await new Promise((resolve, reject) => {
-          chrome.runtime.sendMessage({
-            action: 'send_to_gemini',
-            tabId: geminiTabId,
-            prompt: prompt
-          }, (response) => {
+          chrome.runtime.sendMessage(providerMsg, (response) => {
             if (response?.error) reject(new Error(response.error));
             else resolve(response);
           });
         });
 
         batchReviews = parseGeminiResponse(geminiResponse.response);
-        
-        if (!batchReviews || batchReviews.length === 0) {
-          throw new Error('Empty response');
-        }
+        if (!batchReviews || batchReviews.length === 0) throw new Error('Empty response');
       } catch (e) {
         retries++;
         log(`Batch ${batch + 1} attempt ${retries} failed: ${e.message}`, 'warn');
-        if (retries < 3) {
+
+        if (retries < maxRetries) {
           const msg = (e.message || '').toLowerCase();
           const tabBroken = msg.includes('no response') || msg.includes('connection') ||
                             msg.includes('port closed') || msg.includes('no tab') ||
                             msg.includes('timeout');
+
           if (tabBroken) {
-            // Self-heal: the Gemini tab is unresponsive/closed — reopen it fresh.
-            log('Gemini unresponsive — reopening tab (self-heal)...', 'warn');
+            log('AI tab unresponsive — reopening tab (self-heal)...', 'warn');
             await recoverGemini();
           } else {
-            // Just a bad/empty response — start a clean chat and retry.
+            // Try a clean chat/session before retrying
             await new Promise((resolve) => {
               chrome.runtime.sendMessage({ action: 'new_gemini_chat', tabId: geminiTabId }, resolve);
             });
-            await sleep(2000);
           }
+
+          // Wait before retrying (supports exponential backoff if enabled)
+          const delayMs = Math.max(0, baseDelaySec * (backoff ? Math.pow(2, retries - 1) : 1)) * 1000;
+          log(`Waiting ${Math.round(delayMs/1000)}s before retrying (attempt ${retries + 1}/${maxRetries})...`, 'info');
+          await sleep(delayMs);
         }
       }
+    }
+
+    if (!batchReviews || batchReviews.length === 0) {
+      log(`Batch ${batch + 1} failed after ${maxRetries} ${maxRetries === 1 ? 'attempt' : 'attempts'}, skipping`, 'error');
+      log('Tip: ensure you are logged into the selected AI provider in the opened tab (or configure API mode).', 'warn');
     }
 
     // If the batch failed entirely, repair Gemini before the next batch so one
@@ -2052,7 +2156,7 @@ function sleep(ms) {
 // ============================================================
 // DASHBOARD: tabs, settings, per-ASIN table, history, charts
 // ============================================================
-const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, srcBing: true, srcSocial: true, market: 'in,com', strictMatch: false };
+const SETTINGS_DEFAULTS = { min: 25, max: 100, batch: 10, srcLens: true, srcGoogle: true, srcPinterest: true, srcAmazon: true, srcBing: true, srcSocial: true, market: 'in,com', strictMatch: false, confirmPerFile: false, store: 'dropy', customStoreDomain: '', aiProvider: 'gemini', retry: { maxRetries: 2, delaySec: 5, backoff: true }, fileRetry: { maxRetries: 1, delaySec: 2, backoff: false } };
 let settings = Object.assign({}, SETTINGS_DEFAULTS);
 
 function loadSettings() {
@@ -2070,22 +2174,107 @@ function applySettingsToForm() {
   set('srcBing', settings.srcBing); set('srcSocial', settings.srcSocial);
   set('setMarket', settings.market);
   set('strictMatch', settings.strictMatch);
+  set('confirmPerFile', settings.confirmPerFile);
+  set('storeSelect', settings.store);
+  set('customStoreDomain', settings.customStoreDomain || '');
+  // AI provider + retry settings
+  set('aiProviderSelect', settings.aiProvider || 'gemini');
+  set('retryMax', (settings.retry && settings.retry.maxRetries) || 0);
+  set('retryDelay', (settings.retry && settings.retry.delaySec) || 5);
+  set('retryBackoff', !!(settings.retry && settings.retry.backoff));
+  // per-file retry controls (process-all)
+  set('fileRetryMax', (settings.fileRetry && settings.fileRetry.maxRetries) || 1);
+  set('fileRetryDelay', (settings.fileRetry && settings.fileRetry.delaySec) || 2);
+  set('fileRetryBackoff', !!(settings.fileRetry && settings.fileRetry.backoff));
+
+  // show/hide custom domain row based on storeSelect
+  const csr = document.getElementById('customStoreRow');
+  const sel = document.getElementById('storeSelect');
+  if (csr && sel) csr.style.display = (sel.value === 'other') ? 'block' : 'none';
+
+  // Update the app subtitle to reflect the active store
+  const subtitle = document.querySelector('.subtitle');
+  if (subtitle) {
+    const s = settings.store || 'dropy';
+    if (s === 'dropy') subtitle.textContent = 'Dropy.in Product Reviews';
+    else if (s === 'rudra') subtitle.textContent = 'Rudra Retail Product Reviews';
+    else if (settings.customStoreDomain) subtitle.textContent = `Custom: ${settings.customStoreDomain}`;
+    else subtitle.textContent = 'Custom store product reviews';
+  }
+  // Update AI provider status badge in the header
+  if (typeof updateAiStatus === 'function') updateAiStatus();
 }
 function saveSettings() {
   const num = (id, d, lo, hi) => { let v = parseInt((document.getElementById(id) || {}).value, 10); if (isNaN(v)) v = d; return Math.max(lo, Math.min(hi, v)); };
   const chk = (id) => !!(document.getElementById(id) || {}).checked;
+  const get = (id, d) => ((document.getElementById(id) || {}).value || d);
   settings = {
     min: num('setMin', 25, 1, 500), max: num('setMax', 100, 1, 500), batch: num('setBatch', 10, 1, 20),
     srcLens: chk('srcLens'), srcGoogle: chk('srcGoogle'), srcPinterest: chk('srcPinterest'), srcAmazon: chk('srcAmazon'),
     srcBing: chk('srcBing'), srcSocial: chk('srcSocial'),
     market: (document.getElementById('setMarket') || {}).value || 'in,com',
-    strictMatch: chk('strictMatch')
+    strictMatch: chk('strictMatch'),
+    confirmPerFile: chk('confirmPerFile'),
+    store: get('storeSelect', 'dropy'),
+    customStoreDomain: (get('customStoreDomain', '') || '').trim(),
+    aiProvider: get('aiProviderSelect', 'gemini'),
+    retry: {
+      maxRetries: num('retryMax', 2, 0, 10),
+      delaySec: num('retryDelay', 5, 1, 300),
+      backoff: chk('retryBackoff')
+    },
+    fileRetry: {
+      maxRetries: num('fileRetryMax', 1, 0, 10),
+      delaySec: num('fileRetryDelay', 2, 1, 600),
+      backoff: chk('fileRetryBackoff')
+    }
   };
   if (settings.min > settings.max) { const t = settings.min; settings.min = settings.max; settings.max = t; }
+
+  // Validate custom domain if user selected Other
+  if (settings.store === 'other' && settings.customStoreDomain) {
+    const hostRegex = /^(?!https?:\/\/)([a-z0-9-]+\.)+[a-z]{2,}$/i;
+    if (!hostRegex.test(settings.customStoreDomain)) {
+      alert('Please enter a valid hostname for Custom Domain (e.g. shop.example.com) without https://');
+      return;
+    }
+  }
+
   try { chrome.storage.local.set({ settings }); } catch (e) {}
   applySettingsToForm();
+  updateAiStatus();
   const s = document.getElementById('settingsSaved'); if (s) { s.textContent = 'Saved ✓'; setTimeout(() => { s.textContent = ''; }, 2000); }
 }
+
+// Update AI status badge (reads background ENV)
+function updateAiStatus() {
+  const el = document.getElementById('aiStatus');
+  if (!el) return;
+  try {
+    chrome.runtime.sendMessage({ action: 'get_env_status' }, (resp) => {
+      const prov = (settings && settings.aiProvider) || (resp && resp.defaultProvider) || 'gemini';
+      const apiEnd = (resp && resp.apiEndpoint) || '';
+      const apiKeyOk = !!(resp && resp.apiKeyConfigured);
+      let apiText = apiEnd ? (apiKeyOk ? 'Configured' : 'Missing key') : 'Not configured';
+      el.textContent = `Provider: ${prov} · API: ${apiText}`;
+    });
+  } catch (e) { /* ignore */ }
+}
+
+// Auto-save when store selection or custom domain changes to reduce clicks
+document.addEventListener('DOMContentLoaded', () => {
+  const storeSel = document.getElementById('storeSelect');
+  const customInput = document.getElementById('customStoreDomain');
+  const confirmChk = document.getElementById('confirmPerFile');
+  if (storeSel) storeSel.addEventListener('change', (e) => {
+    const csr = document.getElementById('customStoreRow');
+    if (csr) csr.style.display = (e.target.value === 'other') ? 'block' : 'none';
+    saveSettings();
+  });
+  if (customInput) customInput.addEventListener('blur', () => saveSettings());
+  if (confirmChk) confirmChk.addEventListener('change', () => saveSettings());
+});
+
 function marketDomains() {
   return (settings.market || 'in,com').split(',').map((x) => (x === 'in' ? 'www.amazon.in' : 'www.amazon.com'));
 }
