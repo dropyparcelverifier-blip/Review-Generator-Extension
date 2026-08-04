@@ -1268,9 +1268,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       keepAlive(true);
       try {
-        const q = msg.query || '';
-        if (!q) { sendResponse({ error: 'no query' }); return; }
-        const isUrl = q && (q.startsWith('http:') || q.startsWith('https:'));
+        const rawQ = (msg.query || '').trim();
+        if (!rawQ) { sendResponse({ error: 'no query' }); return; }
+        const isUrl = rawQ && (rawQ.startsWith('http:') || rawQ.startsWith('https:'));
+        // For non-URL queries, strip common store prefixes users may include in lists
+        // (e.g., "Rudra-B0083H8ASG" or "Dropy-B09...") so the store search uses the
+        // plain ASIN/barcode. Keep the original for URL flows.
+        const q = isUrl ? rawQ : rawQ.replace(/^(rudra|rudraretail|rudraretails|dropy)[-_:]?/i, '');
+        if (!q) { sendResponse({ error: 'empty query after normalizing' }); return; }
         if (isUrl) {
           try {
             const u = new URL(q);
