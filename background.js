@@ -1,6 +1,19 @@
 // Load secrets/config from the separate "env" file (config.js).
 try { importScripts('config.js'); } catch (e) { /* config.js optional */ }
 const ENV = self.ENV || {};
+// AI provider and default site from config (config.js)
+const AI_PROVIDER = (ENV.AI_PROVIDER || 'gemini').toLowerCase();
+const DEFAULT_STORE_DOMAIN = (ENV.DEFAULT_STORE_DOMAIN || '').toLowerCase();
+const DEFAULT_STORE_TYPE = (ENV.DEFAULT_STORE_TYPE || 'shopify').toLowerCase();
+
+function aiUrl(provider) {
+  provider = (provider || 'gemini').toLowerCase();
+  if (provider === 'gemini') return 'https://gemini.google.com/app?hl=en-IN';
+  if (provider === 'chatgpt') return 'https://chat.openai.com/';
+  if (provider === 'claude') return 'https://claude.ai/';
+  // Generic placeholder for API-driven providers — open a blank UI page.
+  return 'about:blank';
+}
 
 // Open the app in a FULL browser tab (not a side panel). Clicking the toolbar
 // icon focuses the existing app tab if one is already open, otherwise creates it.
@@ -1015,6 +1028,14 @@ function keepAlive(on) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Expose a lightweight status endpoint for the UI to show which AI provider is active
+  // and whether an API endpoint/key is configured. Reply synchronously if possible.
+  if (msg && msg.action === 'get_env_status') {
+    try {
+      sendResponse({ apiKeyConfigured: !!(ENV && ENV.API_KEY && String(ENV.API_KEY).trim()), apiEndpoint: (ENV && ENV.API_ENDPOINT) || '', defaultProvider: AI_PROVIDER });
+    } catch (e) { sendResponse({ apiKeyConfigured: false, apiEndpoint: '', defaultProvider: AI_PROVIDER }); }
+    return true;
+  }
   if (msg.action === 'save_file') {
     // Silent save — no "Save As" dialog, auto-rename on conflict.
     chrome.downloads.download(
@@ -1243,6 +1264,273 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.action === 'site_lookup') {
+    (async () => {
+      keepAlive(true);
+      try {
+        const q = msg.query || '';
+        if (!q) { sendResponse({ error: 'no query' }); return; }
+        const isUrl = q && (q.startsWith('http:') || q.startsWith('https:'));
+        if (isUrl) {
+          try {
+            const u = new URL(q);
+            const host = (u.hostname || '').toLowerCase();
+            if (host.includes('amazon.')) {
+              const res = await runInTab(q, extractAmazonProduct, { settle: 1500, timeout: 45000 });
+              sendResponse(res || { error: 'no data from amazon extractor' });
+              return;
+            }
+
+            // Shopify-like product pages (explicit /products/ path)
+            if ((u.pathname && u.pathname.toLowerCase().includes('/products/')) || host.endsWith('.myshopify.com') || host.includes('shopify')) {
+              const res = await runInTab(q, extractDropyProductPage, { settle: 1500, timeout: 45000 });
+              sendResponse(res || { error: 'no data from shopify extractor' });
+              return;
+            }
+
+            // Rudra-specific handling: if the host looks like rudraretails.com and the
+            // URL is a store search (e.g., /search?q=... or /search?q=...&page=1), try
+            // to find the first product link and extract it. This covers URLs like
+            // https://rudraretails.com/search?q=B003QXZWYW
+            if (host.includes('rudraretails') || host.includes('rudraretail')) {
+              // First try to fetch the product JSON directly (rudra exposes
+              // Shopify-like product JSON at /products/<handle>.json or a
+              // product page may already end with .json). This avoids opening
+              // a tab and is reliable when available.
+              try {
+                const path = (u.pathname || '').split('?')[0];
+                const candidates = [];
+                if (path.endsWith('.json')) candidates.push(q);
+                if (path.includes('/products/')) {
+                  const base = u.origin + path.replace(/\.json$/, '');
+                  candidates.push(base + '.json', base + '.js');
+                  const handle = (path.split('/products/')[1] || '').split('/')[0];
+                  if (handle) {
+                    candidates.push(u.origin + '/products/' + handle + '.json');
+                    candidates.push(u.origin + '/products/' + handle + '.js');
+                  }
+                }
+                // Try candidates sequentially until a valid product JSON is found
+                for (const cj of candidates) {
+                  try {
+                    const r = await fetch(cj, { method: 'GET' });
+                    if (!r || !r.ok) continue;
+                    const j = await r.json().catch(() => null);
+                    if (!j) continue;
+                    const prod = j.product || j;
+                    if (prod && (prod.title || prod.name)) {
+                      const out = {};
+                      out.name = prod.title || prod.name || '';
+                      out.full_description = (prod.body_html || prod.full_description || '')?.replace(/<[^>]+>/g, ' ').trim() || '';
+                      out.short_description = (prod.body_html || '') ? out.full_description.slice(0, 600) : (prod.short_description || '');
+                      out.images = Array.isArray(prod.images) ? prod.images.slice(0, 20) : (prod.images ? [prod.images] : []);
+                      out.originalImages = out.images.slice();
+                      out.productId = prod.id != null ? String(prod.id) : '';
+                      out.productHandle = prod.handle || '';
+                      out.productUrl = cj;
+                      out.storeProductUrl = out.productHandle ? (u.origin + '/products/' + out.productHandle) : (prod.url || cj);
+                      const bc = (prod.variants && prod.variants.find(v => v && v.barcode)) || null;
+                      if (bc) out.barcode = String(bc.barcode);
+                      out.variants = prod.variants || [];
+                      sendResponse(out);
+                      return;
+                    }
+                  } catch (e) { /* try next candidate */ }
+                }
+              } catch (e) { /* fallback to DOM extraction below */ }
+
+              try {
+                const found = await runInTab(q, function findFirstProductLink() {
+                  try {
+                    const anchors = Array.from(document.querySelectorAll('a[href]'));
+                    for (const a of anchors) {
+                      const href = a.getAttribute('href') || '';
+                      if (!href) continue;
+                      if (/\/products\//i.test(href) || /product\//i.test(href)) return href;
+                      if (/\/p\//i.test(href) || /\/product-/i.test(href)) return href;
+                    }
+                  } catch (e) {}
+                  return null;
+                }, { settle: 2000, timeout: 10000 });
+
+                if (found) {
+                  let prodUrl = found;
+                  try { prodUrl = new URL(found, u.origin).toString(); } catch (e) {}
+                  if (prodUrl.toLowerCase().includes('/products/') || prodUrl.toLowerCase().includes('.myshopify.com')) {
+                    const res = await runInTab(prodUrl, extractDropyProductPage, { settle: 1500, timeout: 45000 });
+                    sendResponse(res || { error: 'no data from shopify extractor' });
+                    return;
+                  }
+                  const res = await runInTab(prodUrl, function extractGenericProduct() {
+                    const out = {};
+                    try {
+                      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                      for (const s of scripts) {
+                        try {
+                          const p = JSON.parse(s.textContent || '');
+                          const items = Array.isArray(p) ? p : (p['@graph'] || [p]);
+                          for (const it of items) {
+                            if (it && (it['@type'] === 'Product' || (Array.isArray(it['@type']) && it['@type'].includes('Product')))) {
+                              out.name = it.name || '';
+                              out.description = (it.description || '').toString();
+                              out.images = Array.isArray(it.image) ? it.image : (it.image ? [it.image] : []);
+                              break;
+                            }
+                          }
+                        } catch (e) {}
+                      }
+                    } catch (e) {}
+                    try {
+                      if (!out.name) out.name = document.querySelector('h1')?.innerText?.trim() || document.title || '';
+                      if (!out.description) {
+                        const og = document.querySelector('meta[property="og:description"], meta[name="description"]');
+                        if (og) out.description = og.getAttribute('content') || '';
+                      }
+                      if (!out.images || !out.images.length) {
+                        const imgs = Array.from(document.querySelectorAll('img')).map(i => i.currentSrc || i.src || i.getAttribute('src') || '').filter(Boolean);
+                        out.images = imgs.slice(0, 10);
+                      }
+                    } catch (e) {}
+                    return out;
+                  }, { settle: 1500, timeout: 30000 });
+                  sendResponse(res || { error: 'no data from generic extractor' });
+                  return;
+                }
+              } catch (e) { /* fall through to generic extractor below */ }
+            }
+
+            // Generic fallback: extract schema or meta/og content from the given URL
+            const res = await runInTab(q, function extractGenericProduct() {
+              const out = {};
+              try {
+                const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                for (const s of scripts) {
+                  try {
+                    const p = JSON.parse(s.textContent || '');
+                    const items = Array.isArray(p) ? p : (p['@graph'] || [p]);
+                    for (const it of items) {
+                      if (it && (it['@type'] === 'Product' || (Array.isArray(it['@type']) && it['@type'].includes('Product')))) {
+                        out.name = it.name || '';
+                        out.description = (it.description || '').toString();
+                        out.images = Array.isArray(it.image) ? it.image : (it.image ? [it.image] : []);
+                        break;
+                      }
+                    }
+                  } catch (e) {}
+                }
+              } catch (e) {}
+              try {
+                if (!out.name) out.name = document.querySelector('h1')?.innerText?.trim() || document.title || '';
+                if (!out.description) {
+                  const og = document.querySelector('meta[property="og:description"], meta[name="description"]');
+                  if (og) out.description = og.getAttribute('content') || '';
+                }
+                if (!out.images || !out.images.length) {
+                  const imgs = Array.from(document.querySelectorAll('img')).map(i => i.currentSrc || i.src || i.getAttribute('src') || '').filter(Boolean);
+                  out.images = imgs.slice(0, 10);
+                }
+              } catch (e) {}
+              return out;
+            }, { settle: 1500, timeout: 30000 });
+            sendResponse(res || { error: 'no data from generic extractor' });
+            return;
+          } catch (e) {
+            sendResponse({ error: e.message || 'invalid url' });
+            return;
+          }
+        } else if (msg.store && (msg.store === 'rudra' || msg.customDomain)) {
+          // Rudra-specific flow: if a custom domain is supplied, try the store's
+          // internal search page first (best-effort). If that doesn't find a
+          // product link, fall back to a Google snippet. This attempts to be
+          // resilient without explicit Rudra pages. `customDomain` should be a
+          // hostname like "shop.example.com".
+          try {
+            const domain = (msg.customDomain || '').trim() || (msg.store === 'rudra' ? 'rudraretails.com' : '');
+            if (domain) {
+              const searchUrl = `https://${domain}/search?q=${encodeURIComponent(q)}`;
+              // Run a small injector to find the first product link on the search
+              // results page. If the store is Shopify-like, product links will
+              // contain /products/ and we can reuse the Shopify extractor; else
+              // fallback to the generic extractor on the product page.
+              const found = await runInTab(searchUrl, function findFirstProductLink() {
+                try {
+                  const anchors = Array.from(document.querySelectorAll('a[href]'));
+                  for (const a of anchors) {
+                    const href = a.getAttribute('href') || '';
+                    if (!href) continue;
+                    // Prefer product path hints
+                    if (/\/products\//i.test(href) || /product\//i.test(href)) return href;
+                    // Heuristic: links containing "product" or long slug-like paths
+                    if (/product|\/p\//i.test(href) && href.split('/').length > 2) return href;
+                  }
+                } catch (e) {}
+                return null;
+              }, { settle: 2000, timeout: 10000 });
+
+              if (found) {
+                // Resolve relative URLs against the domain
+                let prodUrl = found;
+                try { prodUrl = new URL(found, 'https://' + domain).toString(); } catch (e) {}
+                // If it's a Shopify-style product path, run the Shopify extractor
+                if (prodUrl.toLowerCase().includes('/products/') || prodUrl.toLowerCase().includes('.myshopify.com')) {
+                  const res = await runInTab(prodUrl, extractDropyProductPage, { settle: 1500, timeout: 45000 });
+                  sendResponse(res || { error: 'no data from shopify extractor' });
+                  return;
+                }
+                // Otherwise try the generic product extractor on the product URL
+                const res = await runInTab(prodUrl, function extractGenericProduct() {
+                  const out = {};
+                  try {
+                    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const s of scripts) {
+                      try {
+                        const p = JSON.parse(s.textContent || '');
+                        const items = Array.isArray(p) ? p : (p['@graph'] || [p]);
+                        for (const it of items) {
+                          if (it && (it['@type'] === 'Product' || (Array.isArray(it['@type']) && it['@type'].includes('Product')))) {
+                            out.name = it.name || '';
+                            out.description = (it.description || '').toString();
+                            out.images = Array.isArray(it.image) ? it.image : (it.image ? [it.image] : []);
+                            break;
+                          }
+                        }
+                      } catch (e) {}
+                    }
+                  } catch (e) {}
+                  try {
+                    if (!out.name) out.name = document.querySelector('h1')?.innerText?.trim() || document.title || '';
+                    if (!out.description) {
+                      const og = document.querySelector('meta[property="og:description"], meta[name="description"]');
+                      if (og) out.description = og.getAttribute('content') || '';
+                    }
+                    if (!out.images || !out.images.length) {
+                      const imgs = Array.from(document.querySelectorAll('img')).map(i => i.currentSrc || i.src || i.getAttribute('src') || '').filter(Boolean);
+                      out.images = imgs.slice(0, 10);
+                    }
+                  } catch (e) {}
+                  return out;
+                }, { settle: 1500, timeout: 30000 });
+                sendResponse(res || { error: 'no data from rudra product page' });
+                return;
+              }
+            }
+          } catch (e) { /* fall back to web snippet */ }
+          // Fallback: return a Google snippet for the query
+          const url = 'https://www.google.com/search?q=' + encodeURIComponent(q);
+          const scraped = await runInTab(url, scrapeAiOverview, { settle: 3000, timeout: 30000 });
+          sendResponse({ searchSnippet: (scraped && scraped.text) || '' });
+          return;
+        } else {
+          const url = 'https://www.google.com/search?q=' + encodeURIComponent(q);
+          const scraped = await runInTab(url, scrapeAiOverview, { settle: 3000, timeout: 30000 });
+          sendResponse({ searchSnippet: (scraped && scraped.text) || '' });
+          return;
+        }
+      } catch (e) { sendResponse({ error: e.message || 'site_lookup failed' }); } finally { keepAlive(false); }
+    })();
+    return true;
+  }
+
   if (msg.action === 'scrape_dropy') {
     chrome.tabs.create({ url: msg.url, active: false }, (tab) => {
       if (chrome.runtime.lastError || !tab || tab.id == null) { sendResponse({ error: 'could not open tab' }); return; }
@@ -1318,34 +1606,90 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'open_gemini') {
-    chrome.tabs.create({ url: 'https://gemini.google.com/app?hl=en-IN', active: false }, (tab) => {
-      if (chrome.runtime.lastError || !tab || tab.id == null) {
-        sendResponse({ error: chrome.runtime.lastError?.message || 'could not open Gemini tab' });
-        return;
+        // Allow the caller to override the provider (e.g., ChatGPT/Claude/API) via msg.provider
+        const provider = (msg && msg.provider) ? msg.provider : AI_PROVIDER;
+        const url = aiUrl(provider);
+        chrome.tabs.create({ url: url, active: false }, (tab) => {
+          if (chrome.runtime.lastError || !tab || tab.id == null) {
+            sendResponse({ error: chrome.runtime.lastError?.message || 'could not open AI tab' });
+            return;
+          }
+          sendResponse({ tabId: tab.id });
+        });
+        return true;
       }
-      sendResponse({ tabId: tab.id });
-    });
-    return true;
-  }
 
   if (msg.action === 'send_to_gemini') {
     keepAlive(true); // Gemini generation is long — keep the SW alive until it replies
-    // Guard: if the Gemini content script holds the channel open but never replies
-    // (generation wedged, tab frozen), settle ONCE after a timeout so the keepAlive
-    // ref is released (no permanent SW pin) and the app-side promise doesn't hang.
     let settled = false;
     const done = (resp) => { if (settled) return; settled = true; clearTimeout(guard); keepAlive(false); sendResponse(resp); };
     const guard = setTimeout(() => done({ error: 'Gemini timed out (no response)' }), 150000);
-    try {
-      chrome.tabs.sendMessage(msg.tabId, {
-        action: 'inject_prompt',
-        prompt: msg.prompt
-      }, (response) => {
-        done(response || { error: chrome.runtime.lastError?.message || 'No response from Gemini' });
-      });
-    } catch (e) {
-      done({ error: 'send failed: ' + e.message }); // sendMessage threw synchronously
-    }
+
+    // Pre-check and gentle poke: run a small script inside the Gemini tab that
+    // scrolls a bit (to wake rendering) and reports whether the page appears
+    // alive and whether a visible "Stop" control is present (i.e. it's
+    // currently generating). If the tab looks dead, try a reload before sending.
+    const ensureTabGood = () => new Promise((resolve) => {
+      try {
+        chrome.scripting.executeScript({
+          target: { tabId: msg.tabId },
+          func: function preCheck() {
+            try { window.scrollBy(0, 100); setTimeout(function(){ window.scrollBy(0, -100); }, 200); } catch (e) {}
+            try {
+              const buttons = document.querySelectorAll('button');
+              let generating = false;
+              for (const b of buttons) {
+                const al = (b.getAttribute('aria-label') || '').toLowerCase();
+                const t = (b.innerText || '').toLowerCase();
+                if ((al && al.indexOf('stop') !== -1) || t.indexOf('stop response') !== -1 || t === 'stop') {
+                  if (b.offsetParent !== null) { generating = true; break; }
+                }
+              }
+              const alive = !document.hidden && document.readyState === 'complete';
+              return { generating: generating, alive: alive };
+            } catch (e) { return null; }
+          }
+        }, (res) => { resolve((res && res[0] && res[0].result) || null); });
+      } catch (e) { resolve(null); }
+    });
+
+    (async () => {
+      try {
+        // If configured to use an API provider, call the configured endpoint
+        // directly instead of using a content script/tab. The API is expected
+        // to accept JSON { prompt } and return JSON with `response` or `text`.
+        if ((AI_PROVIDER === 'api') || (msg && msg.provider === 'api')) {
+          const endpoint = (ENV.API_ENDPOINT || '').trim();
+          const key = (ENV.API_KEY || '').trim();
+          if (!endpoint) { done({ error: 'API_ENDPOINT not configured' }); return; }
+          try {
+            const headers = { 'Content-Type': 'application/json' };
+            if (key) headers['Authorization'] = 'Bearer ' + key;
+            const r = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ prompt: msg.prompt }) });
+            const j = await r.json().catch(() => null);
+            const txt = (j && (j.response || j.text)) || (j && j.choices && j.choices[0] && (j.choices[0].text || (j.choices[0].message && j.choices[0].message.content))) || '';
+            done({ response: txt, raw: j });
+            return;
+          } catch (e) { done({ error: 'API request failed: ' + e.message }); return; }
+        }
+
+        let pre = await ensureTabGood();
+        if (!pre || pre.alive === false) {
+          // Try a reload once to recover hung/frozen Gemini tabs
+          try { chrome.tabs.reload(msg.tabId); await new Promise(r => setTimeout(r, 2500)); pre = await ensureTabGood(); } catch (e) {}
+        }
+        // Proceed to send the prompt. If the content script cannot reply, the
+        // guard above ensures the SW does not remain pinned forever.
+        chrome.tabs.sendMessage(msg.tabId, {
+          action: 'inject_prompt',
+          prompt: msg.prompt
+        }, (response) => {
+          done(response || { error: chrome.runtime.lastError?.message || 'No response from Gemini' });
+        });
+      } catch (e) {
+        done({ error: 'send failed: ' + e.message }); // sendMessage threw synchronously
+      }
+    })();
     return true;
   }
 
@@ -1366,9 +1710,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === 'new_gemini_chat') {
-    chrome.tabs.update(msg.tabId, { url: 'https://gemini.google.com/app?hl=en-IN' }, () => {
-      sendResponse({ done: true });
-    });
-    return true;
-  }
+        const provider = (msg && msg.provider) ? msg.provider : AI_PROVIDER;
+        const url = aiUrl(provider);
+        chrome.tabs.update(msg.tabId, { url: url }, () => {
+          sendResponse({ done: true });
+        });
+        return true;
+      }
 });
